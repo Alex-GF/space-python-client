@@ -11,6 +11,21 @@ class SpaceClientFactory:
         api_key: str | None = None,
         timeout: int | None = None,
     ) -> SpaceClient:
+        """Build and validate a Space client instance.
+
+        Args:
+            options_or_url (SpaceConnectionOptions | str): Either a full options object
+                or a base URL string.
+            api_key (str | None): API key used when `options_or_url` is a URL string.
+            timeout (int | None): Timeout in milliseconds used when `options_or_url`
+                is a URL string. Defaults to 5000.
+
+        Returns:
+            SpaceClient: Configured client ready for HTTP and WebSocket operations.
+
+        Raises:
+            ValueError: If URL, API key, or timeout values are invalid.
+        """
         if isinstance(options_or_url, SpaceConnectionOptions):
             options = options_or_url
         else:

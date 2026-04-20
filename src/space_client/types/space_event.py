@@ -11,6 +11,14 @@ class SpaceEvent(str, Enum):
 
     @classmethod
     def from_string(cls, text: str) -> "SpaceEvent | None":
+        """Resolve enum value from string.
+
+        Args:
+            text (str): Event name in any case.
+
+        Returns:
+            SpaceEvent | None: Matching enum value, or None if text is unknown.
+        """
         lowered = text.lower()
         for event in cls:
             if event.value == lowered:

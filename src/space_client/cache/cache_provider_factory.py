@@ -9,6 +9,17 @@ from .redis_cache_provider import RedisCacheProvider
 class CacheProviderFactory:
     @staticmethod
     def create(options: CacheOptions) -> CacheProvider:
+        """Create a concrete cache provider.
+
+        Args:
+            options (CacheOptions): Cache configuration.
+
+        Returns:
+            CacheProvider: Built-in or Redis provider depending on configuration.
+
+        Raises:
+            ValueError: If Redis is selected but configuration is incomplete.
+        """
         if options.type == CacheType.REDIS:
             if options.external is None or options.external.redis is None:
                 raise ValueError("Redis configuration is required when using Redis cache type")
@@ -17,6 +28,17 @@ class CacheProviderFactory:
 
     @staticmethod
     def validate(options: CacheOptions) -> None:
+        """Validate cache configuration values.
+
+        Args:
+            options (CacheOptions): Cache configuration.
+
+        Returns:
+            None: No value is returned.
+
+        Raises:
+            ValueError: If any cache option value is invalid.
+        """
         if not options.enabled:
             return
 

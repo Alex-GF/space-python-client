@@ -11,6 +11,14 @@ class EvaluationError:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "EvaluationError | None":
+        """Build an error model from payload.
+
+        Args:
+            data (dict[str, Any] | None): Raw API error object.
+
+        Returns:
+            EvaluationError | None: Parsed error model or None when input is None.
+        """
         if data is None:
             return None
         return cls(code=str(data.get("code", "")), message=str(data.get("message", "")))
@@ -25,6 +33,14 @@ class FeatureEvaluationResult:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "FeatureEvaluationResult":
+        """Build evaluation result from payload.
+
+        Args:
+            data (dict[str, Any] | None): Raw API response object.
+
+        Returns:
+            FeatureEvaluationResult: Parsed evaluation result.
+        """
         payload = data or {}
         return cls(
             eval=bool(payload.get("eval", False)),
@@ -34,6 +50,11 @@ class FeatureEvaluationResult:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert model to payload dictionary.
+
+        Returns:
+            dict[str, Any]: JSON-serializable representation.
+        """
         result = asdict(self)
         if self.error is None:
             result["error"] = None
@@ -51,6 +72,14 @@ class UserContact:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UserContact | None":
+        """Build user contact from payload.
+
+        Args:
+            data (dict[str, Any] | None): Raw contact payload.
+
+        Returns:
+            UserContact | None: Parsed model or None when input is None.
+        """
         if data is None:
             return None
         return cls(
@@ -63,6 +92,11 @@ class UserContact:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert model to payload dictionary.
+
+        Returns:
+            dict[str, Any]: API-compatible contact object.
+        """
         return {
             "userId": self.user_id,
             "username": self.username,
@@ -82,6 +116,14 @@ class BillingPeriod:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "BillingPeriod | None":
+        """Build billing period from payload.
+
+        Args:
+            data (dict[str, Any] | None): Raw billing period payload.
+
+        Returns:
+            BillingPeriod | None: Parsed model or None when input is None.
+        """
         if data is None:
             return None
         return cls(
@@ -98,6 +140,11 @@ class BillingPeriodToCreate:
     renewal_days: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert model to payload dictionary.
+
+        Returns:
+            dict[str, Any]: API-compatible creation payload.
+        """
         return {
             "autoRenew": self.auto_renew,
             "renewalDays": self.renewal_days,
@@ -111,6 +158,14 @@ class UsageLevel:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | int | float | None) -> "UsageLevel":
+        """Build usage level from payload.
+
+        Args:
+            data (dict[str, Any] | int | float | None): Raw usage object or scalar.
+
+        Returns:
+            UsageLevel: Parsed usage model.
+        """
         if isinstance(data, (int, float)):
             return cls(reset_time_stamp=None, consumed=float(data))
         payload = data or {}
@@ -130,6 +185,14 @@ class ContractHistoryEntry:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ContractHistoryEntry":
+        """Build contract history entry from payload.
+
+        Args:
+            data (dict[str, Any] | None): Raw history payload.
+
+        Returns:
+            ContractHistoryEntry: Parsed history model.
+        """
         payload = data or {}
         return cls(
             start_date=payload.get("startDate"),
@@ -156,10 +219,23 @@ class Contract:
 
     @property
     def user_id(self) -> str | None:
+        """Get user identifier from nested contact.
+
+        Returns:
+            str | None: User identifier, or None when contact is unavailable.
+        """
         return self.user_contact.user_id if self.user_contact else None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "Contract":
+        """Build contract model from payload.
+
+        Args:
+            data (dict[str, Any] | None): Raw contract payload.
+
+        Returns:
+            Contract: Parsed contract model.
+        """
         payload = data or {}
         usage_levels_raw = payload.get("usageLevels", {})
         usage_levels: dict[str, dict[str, UsageLevel]] = {}
@@ -185,6 +261,11 @@ class Contract:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert model to payload dictionary.
+
+        Returns:
+            dict[str, Any]: JSON-serializable contract object.
+        """
         return {
             "id": self.id,
             "_id": self.mongo_id,
@@ -216,6 +297,11 @@ class ContractToCreate:
     subscription_add_ons: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert model to payload dictionary.
+
+        Returns:
+            dict[str, Any]: API-compatible contract creation payload.
+        """
         return {
             "userContact": self.user_contact.to_dict(),
             "billingPeriod": self.billing_period.to_dict(),
@@ -233,6 +319,11 @@ class Subscription:
     subscription_add_ons: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert model to payload dictionary.
+
+        Returns:
+            dict[str, Any]: API-compatible subscription update payload.
+        """
         return {
             "contractedServices": self.contracted_services,
             "subscriptionPlans": self.subscription_plans,

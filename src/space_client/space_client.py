@@ -23,6 +23,18 @@ class SpaceClient:
     }
 
     def __init__(self, options: SpaceConnectionOptions) -> None:
+        """Create a new Space client.
+
+        Args:
+            options (SpaceConnectionOptions): Connection settings including URL, API key,
+                timeout, and optional cache configuration.
+
+        Returns:
+            None: This constructor initializes client state and modules.
+
+        Raises:
+            ValueError: If URL or API key are missing.
+        """
         if not options.url:
             raise ValueError("URL is required")
         if not options.api_key:
@@ -74,23 +86,58 @@ class SpaceClient:
                 callback(error)
 
     def is_connected_to_space(self) -> bool:
+        """Check Space health endpoint availability.
+
+        Returns:
+            bool: True when `/healthcheck` responds successfully with a `message` field,
+            otherwise False.
+        """
         payload = self._request_json("GET", "/healthcheck")
         return isinstance(payload, dict) and "message" in payload
 
     def on(self, event: str, callback: Callable[[Any], None]) -> None:
+        """Register an event listener callback.
+
+        Args:
+            event (str): Event name. Supported values include synchronized,
+                pricing_created, pricing_archived, pricing_actived,
+                service_disabled, and error.
+            callback (Callable[[Any], None]): Function invoked with event payload.
+
+        Returns:
+            None: Listener registration updates internal callback registry.
+        """
         event_lower = event.lower()
         if event_lower in self._VALID_EVENTS:
             self._callbacks[event_lower] = callback
 
     def remove_listener(self, event: str) -> None:
+        """Remove the callback associated with an event.
+
+        Args:
+            event (str): Event name to deregister.
+
+        Returns:
+            None: No value is returned.
+        """
         event_lower = event.lower()
         if event_lower in self._VALID_EVENTS:
             self._callbacks.pop(event_lower, None)
 
     def remove_all_listeners(self) -> None:
+        """Remove all registered callbacks.
+
+        Returns:
+            None: No value is returned.
+        """
         self._callbacks.clear()
 
     def connect(self) -> None:
+        """Open the WebSocket connection to Space pricing events.
+
+        Returns:
+            None: Connection is attempted asynchronously; failures are ignored.
+        """
         if self._socket.connected:
             return
         try:
@@ -101,6 +148,11 @@ class SpaceClient:
             return
 
     def disconnect(self) -> None:
+        """Close active WebSocket connection.
+
+        Returns:
+            None: No value is returned.
+        """
         try:
             if self._socket.connected:
                 self._socket.disconnect()
@@ -108,17 +160,37 @@ class SpaceClient:
             return
 
     def close(self) -> None:
+        """Release all client resources.
+
+        Returns:
+            None: No value is returned.
+        """
         self.disconnect()
         self.cache.close()
         self._http_client.close()
 
     def get_http_url(self) -> str:
+        """Get internal API URL.
+
+        Returns:
+            str: Base HTTP URL including `/api/v1` suffix.
+        """
         return self._http_url
 
     def get_api_key(self) -> str:
+        """Get configured API key.
+
+        Returns:
+            str: API key currently used by the client.
+        """
         return self._api_key
 
     def get_timeout(self) -> int:
+        """Get configured timeout.
+
+        Returns:
+            int: HTTP timeout in milliseconds.
+        """
         return self._timeout
 
     def _request_json(self, method: str, path: str, json: Any | None = None) -> dict[str, Any] | list[Any] | None:

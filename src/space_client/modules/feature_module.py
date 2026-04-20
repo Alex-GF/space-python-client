@@ -10,6 +10,14 @@ if TYPE_CHECKING:
 
 class FeatureModule:
     def __init__(self, space_client: "SpaceClient") -> None:
+        """Create feature operations module.
+
+        Args:
+            space_client (SpaceClient): Parent client used for transport and cache.
+
+        Returns:
+            None: Constructor only stores references.
+        """
         self._space_client = space_client
 
     def evaluate(
@@ -20,6 +28,19 @@ class FeatureModule:
         details: bool = False,
         server: bool = False,
     ) -> FeatureEvaluationResult:
+        """Evaluate a feature for a user.
+
+        Args:
+            user_id (str): User identifier.
+            feature_id (str): Feature identifier, usually `service-feature`.
+            expected_consumption (dict[str, int | float] | None): Optional consumption
+                projection used by Space for optimistic updates.
+            details (bool): Whether to request detailed evaluation information.
+            server (bool): Whether to force server-side evaluation mode.
+
+        Returns:
+            FeatureEvaluationResult: Evaluation outcome, including optional error payload.
+        """
         expected_consumption = expected_consumption or {}
         cache = self._space_client.cache
         is_read_only = len(expected_consumption) == 0
@@ -62,6 +83,16 @@ class FeatureModule:
         return result
 
     def revert_evaluation(self, user_id: str, feature_id: str, revert_to_latest: bool = True) -> bool:
+        """Revert usage changes done by a previous optimistic evaluation.
+
+        Args:
+            user_id (str): User identifier.
+            feature_id (str): Feature identifier.
+            revert_to_latest (bool): True to restore latest value, False for earliest.
+
+        Returns:
+            bool: True when the revert request succeeds, otherwise False.
+        """
         success = self._space_client._request_no_content(
             "POST",
             f"/features/{user_id}?revert=true&latest={str(revert_to_latest).lower()}",
@@ -79,6 +110,14 @@ class FeatureModule:
         return True
 
     def generate_user_pricing_token(self, user_id: str) -> str | None:
+        """Generate a pricing token for a user.
+
+        Args:
+            user_id (str): User identifier.
+
+        Returns:
+            str | None: Token string on success, otherwise None.
+        """
         cache = self._space_client.cache
         cache_key = cache.get_pricing_token_key(user_id)
 

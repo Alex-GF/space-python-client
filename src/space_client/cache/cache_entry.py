@@ -12,6 +12,11 @@ class CacheEntry:
     created_at: float
 
     def is_expired(self) -> bool:
+        """Check whether entry has expired.
+
+        Returns:
+            bool: True when current time exceeds entry TTL, otherwise False.
+        """
         if self.ttl_seconds <= 0:
             return False
         return (time() - self.created_at) >= self.ttl_seconds
