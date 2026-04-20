@@ -18,7 +18,6 @@ Python client library for [Space](https://github.com/isa-group/space), a pricing
 - [WebSocket Events](#websocket-events)
 - [Error Handling](#error-handling)
 - [Testing](#testing)
-- [Publishing to PyPI](#publishing-to-pypi)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -257,16 +256,6 @@ pytest
 ```
 
 CI executes tests on every pull request for Python `3.10`, `3.11`, and `3.12`.
-
-## Publishing to PyPI
-
-The repository includes a release workflow that publishes automatically to PyPI when a GitHub Release is published.
-
-Recommended setup:
-
-1. Configure PyPI Trusted Publishing for your GitHub repository.
-2. Create a new GitHub Release (tag like `v0.1.0`).
-3. The workflow builds the package and publishes it to PyPI.
 
 ## Contributing
 
