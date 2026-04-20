@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+@dataclass
+class EvaluationError:
+    code: str
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "EvaluationError | None":
+        if data is None:
+            return None
+        return cls(code=str(data.get("code", "")), message=str(data.get("message", "")))
+
+
+@dataclass
+class FeatureEvaluationResult:
+    eval: bool = False
+    used: dict[str, Any] = field(default_factory=dict)
+    limit: dict[str, Any] = field(default_factory=dict)
+    error: EvaluationError | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "FeatureEvaluationResult":
+        payload = data or {}
+        return cls(
+            eval=bool(payload.get("eval", False)),
+            used=dict(payload.get("used", {})),
+            limit=dict(payload.get("limit", {})),
+            error=EvaluationError.from_dict(payload.get("error")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        if self.error is None:
+            result["error"] = None
+        return result
+
+
+@dataclass
+class UserContact:
+    user_id: str
+    username: str
+    first_name: str = ""
+    last_name: str = ""
+    email: str | None = None
+    phone: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "UserContact | None":
+        if data is None:
+            return None
+        return cls(
+            user_id=str(data.get("userId", "")),
+            username=str(data.get("username", "")),
+            first_name=str(data.get("firstName", "")),
+            last_name=str(data.get("lastName", "")),
+            email=data.get("email"),
+            phone=data.get("phone"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "userId": self.user_id,
+            "username": self.username,
+            "firstName": self.first_name,
+            "lastName": self.last_name,
+            "email": self.email,
+            "phone": self.phone,
+        }
+
+
+@dataclass
+class BillingPeriod:
+    start_date: str | None = None
+    end_date: str | None = None
+    auto_renew: bool = False
+    renewal_days: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "BillingPeriod | None":
+        if data is None:
+            return None
+        return cls(
+            start_date=data.get("startDate"),
+            end_date=data.get("endDate"),
+            auto_renew=bool(data.get("autoRenew", False)),
+            renewal_days=int(data.get("renewalDays", 0)),
+        )
+
+
+@dataclass
+class BillingPeriodToCreate:
+    auto_renew: bool | None = None
+    renewal_days: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "autoRenew": self.auto_renew,
+            "renewalDays": self.renewal_days,
+        }
+
+
+@dataclass
+class UsageLevel:
+    reset_time_stamp: str | None = None
+    consumed: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | int | float | None) -> "UsageLevel":
+        if isinstance(data, (int, float)):
+            return cls(reset_time_stamp=None, consumed=float(data))
+        payload = data or {}
+        return cls(
+            reset_time_stamp=payload.get("resetTimeStamp"),
+            consumed=float(payload.get("consumed", 0.0)),
+        )
+
+
+@dataclass
+class ContractHistoryEntry:
+    start_date: str | None = None
+    end_date: str | None = None
+    contracted_services: dict[str, str] = field(default_factory=dict)
+    subscription_plans: dict[str, str] = field(default_factory=dict)
+    subscription_add_ons: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ContractHistoryEntry":
+        payload = data or {}
+        return cls(
+            start_date=payload.get("startDate"),
+            end_date=payload.get("endDate"),
+            contracted_services=dict(payload.get("contractedServices", {})),
+            subscription_plans=dict(payload.get("subscriptionPlans", {})),
+            subscription_add_ons=dict(payload.get("subscriptionAddOns", {})),
+        )
+
+
+@dataclass
+class Contract:
+    id: str | None = None
+    mongo_id: str | None = None
+    user_contact: UserContact | None = None
+    billing_period: BillingPeriod | None = None
+    organization_id: str | None = None
+    group_id: str | None = None
+    usage_levels: dict[str, dict[str, UsageLevel]] = field(default_factory=dict)
+    contracted_services: dict[str, str] = field(default_factory=dict)
+    subscription_plans: dict[str, str] = field(default_factory=dict)
+    subscription_add_ons: dict[str, dict[str, int]] = field(default_factory=dict)
+    history: list[ContractHistoryEntry] = field(default_factory=list)
+
+    @property
+    def user_id(self) -> str | None:
+        return self.user_contact.user_id if self.user_contact else None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "Contract":
+        payload = data or {}
+        usage_levels_raw = payload.get("usageLevels", {})
+        usage_levels: dict[str, dict[str, UsageLevel]] = {}
+        for service_name, feature_levels in usage_levels_raw.items():
+            usage_levels[service_name] = {
+                feature_name: UsageLevel.from_dict(level)
+                for feature_name, level in dict(feature_levels).items()
+            }
+
+        history_raw = payload.get("history", [])
+        return cls(
+            id=payload.get("id"),
+            mongo_id=payload.get("_id"),
+            user_contact=UserContact.from_dict(payload.get("userContact")),
+            billing_period=BillingPeriod.from_dict(payload.get("billingPeriod")),
+            organization_id=payload.get("organizationId"),
+            group_id=payload.get("groupId"),
+            usage_levels=usage_levels,
+            contracted_services=dict(payload.get("contractedServices", {})),
+            subscription_plans=dict(payload.get("subscriptionPlans", {})),
+            subscription_add_ons=dict(payload.get("subscriptionAddOns", {})),
+            history=[ContractHistoryEntry.from_dict(item) for item in history_raw],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "_id": self.mongo_id,
+            "userContact": self.user_contact.to_dict() if self.user_contact else None,
+            "billingPeriod": asdict(self.billing_period) if self.billing_period else None,
+            "organizationId": self.organization_id,
+            "groupId": self.group_id,
+            "usageLevels": {
+                service_name: {
+                    feature_name: asdict(level)
+                    for feature_name, level in features.items()
+                }
+                for service_name, features in self.usage_levels.items()
+            },
+            "contractedServices": self.contracted_services,
+            "subscriptionPlans": self.subscription_plans,
+            "subscriptionAddOns": self.subscription_add_ons,
+            "history": [asdict(entry) for entry in self.history],
+        }
+
+
+@dataclass
+class ContractToCreate:
+    user_contact: UserContact
+    billing_period: BillingPeriodToCreate
+    contracted_services: dict[str, str]
+    group_id: str | None = None
+    subscription_plans: dict[str, str] = field(default_factory=dict)
+    subscription_add_ons: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "userContact": self.user_contact.to_dict(),
+            "billingPeriod": self.billing_period.to_dict(),
+            "contractedServices": self.contracted_services,
+            "groupId": self.group_id,
+            "subscriptionPlans": self.subscription_plans,
+            "subscriptionAddOns": self.subscription_add_ons,
+        }
+
+
+@dataclass
+class Subscription:
+    contracted_services: dict[str, str] = field(default_factory=dict)
+    subscription_plans: dict[str, str] = field(default_factory=dict)
+    subscription_add_ons: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contractedServices": self.contracted_services,
+            "subscriptionPlans": self.subscription_plans,
+            "subscriptionAddOns": self.subscription_add_ons,
+        }
+
+
+__all__ = [
+    "BillingPeriod",
+    "BillingPeriodToCreate",
+    "Contract",
+    "ContractHistoryEntry",
+    "ContractToCreate",
+    "EvaluationError",
+    "FeatureEvaluationResult",
+    "Subscription",
+    "UsageLevel",
+    "UserContact",
+]
