@@ -94,17 +94,26 @@ class UserContact:
     def to_dict(self) -> dict[str, Any]:
         """Convert model to payload dictionary.
 
+        Optional fields that were never set are omitted rather than sent as
+        JSON null. Space marks them optional in a way that accepts a missing
+        key and refuses an explicit null - ``{"phone": null}`` comes back as
+        ``422 The userContact.phone field must be a string`` - so serialising
+        an unset field makes the dataclass default unusable.
+
         Returns:
             dict[str, Any]: API-compatible contact object.
         """
-        return {
+        payload: dict[str, Any] = {
             "userId": self.user_id,
             "username": self.username,
             "firstName": self.first_name,
             "lastName": self.last_name,
-            "email": self.email,
-            "phone": self.phone,
         }
+        if self.email is not None:
+            payload["email"] = self.email
+        if self.phone is not None:
+            payload["phone"] = self.phone
+        return payload
 
 
 @dataclass
