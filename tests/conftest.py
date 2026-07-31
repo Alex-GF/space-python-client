@@ -31,8 +31,20 @@ class FakeSocketClient:
             handler(data)
 
 
+class FakeAsyncSocketClient(FakeSocketClient):
+    """The same stub, with the two methods the async socket awaits."""
+
+    async def connect(self, *args, **kwargs):  # type: ignore[override]
+        self.connected = True
+
+    async def disconnect(self):  # type: ignore[override]
+        self.connected = False
+
+
 @pytest.fixture(autouse=True)
 def patch_socketio_client(monkeypatch):
+    from space_client import async_space_client as async_client_module
     from space_client import space_client as client_module
 
     monkeypatch.setattr(client_module.socketio, "Client", FakeSocketClient)
+    monkeypatch.setattr(async_client_module.socketio, "AsyncClient", FakeAsyncSocketClient)
