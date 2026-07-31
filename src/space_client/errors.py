@@ -1,0 +1,77 @@
+"""Errors the client raises when Space refuses or cannot be reached.
+
+Every HTTP call used to answer ``None`` for three different situations: the
+server refused the request, the server could not be reached, and the server
+answered with nothing. A caller holding a ``None`` could not tell which had
+happened, so the only two options were to treat every failure as absence or to
+guess.
+
+That matters most for the calls that change something. ``add_contract``
+returning ``None`` looks exactly the same whether a contract was created and
+the body was empty or whether Space answered ``400 Plan FREE for service X not
+found in the request organization`` - and in the second case an application
+carries on believing its user is subscribed.
+
+These are deliberately narrow: ``SpaceApiError`` carries what the server said,
+``SpaceConnectionError`` says it was never reached, and both derive from
+``SpaceError`` so a caller who does not care about the difference can catch one
+thing.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+class SpaceError(Exception):
+    """Anything that went wrong talking to Space."""
+
+
+class SpaceConnectionError(SpaceError):
+    """Space could not be reached at all.
+
+    A timeout, a refused connection, DNS - the request never got an answer, so
+    nothing can be said about whether it took effect.
+    """
+
+
+class SpaceApiError(SpaceError):
+    """Space answered, and the answer was a refusal.
+
+    Carries the status and the body, because the body is where Space explains
+    itself: "Plan FREE for service openbinding not found in the request
+    organization" is the difference between a bug and a configuration mistake,
+    and it is lost the moment the response is turned into ``None``.
+    """
+
+    def __init__(self, status_code: int, method: str, path: str, payload: Any = None):
+        self.status_code = status_code
+        self.method = method
+        self.path = path
+        self.payload = payload
+
+        detail = _describe(payload)
+        super().__init__(
+            f"Space answered {status_code} to {method} {path}"
+            + (f": {detail}" if detail else "")
+        )
+
+
+def _describe(payload: Any) -> str:
+    """The server's own explanation, when it gave one.
+
+    Space reports errors as ``{"error": "..."}`` and sometimes adds
+    ``details``; anything else is included as-is rather than dropped, since an
+    unexpected shape is still more informative than nothing.
+    """
+    if payload is None:
+        return ""
+    if isinstance(payload, dict):
+        message = payload.get("error") or payload.get("message")
+        details = payload.get("details")
+        if message and details:
+            return f"{message} ({details})"
+        if message:
+            return str(message)
+    text = str(payload).strip()
+    return text[:500]
