@@ -1,26 +1,25 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
+from .. import _operations as operations
+from .._result import Result
 from ..types.models import Contract, ContractToCreate, Subscription
-
-if TYPE_CHECKING:
-    from ..space_client import SpaceClient
+from ._runner import AsyncRunner, SyncRunner
 
 
-class ContractModule:
-    def __init__(self, space_client: "SpaceClient") -> None:
-        """Create contract operations module.
+class _ContractCalls:
+    """The contract calls, written once.
 
-        Args:
-            space_client (SpaceClient): Parent client used for transport and cache.
+    Each method says what to do and hands it to ``self._run``, which is the only
+    part that differs between the synchronous and asynchronous clients. On
+    :class:`ContractModule` these methods return their value; on
+    :class:`AsyncContractModule` they return an awaitable of that value.
+    """
 
-        Returns:
-            None: Constructor only stores references.
-        """
-        self._space_client = space_client
+    _run: Any
 
-    def get_contract(self, user_id: str) -> Contract | None:
+    def get_contract(self, user_id: str) -> Result[Contract | None]:
         """Get a contract by user identifier.
 
         Args:
@@ -29,24 +28,9 @@ class ContractModule:
         Returns:
             Contract | None: Parsed contract on success, otherwise None.
         """
-        cache = self._space_client.cache
-        cache_key = cache.get_contract_key(user_id)
+        return self._run(operations.get_contract(user_id))
 
-        if cache.is_enabled():
-            cached = cache.get(cache_key, parser=Contract.from_dict)
-            if cached is not None:
-                return cached
-
-        payload = self._space_client._request_json("GET", f"/contracts/{user_id}")
-        if payload is None:
-            return None
-
-        contract = Contract.from_dict(payload)
-        if cache.is_enabled():
-            cache.set(cache_key, payload)
-        return contract
-
-    def add_contract(self, contract_to_create: ContractToCreate) -> Contract | None:
+    def add_contract(self, contract_to_create: ContractToCreate) -> Result[Contract | None]:
         """Create a contract in Space.
 
         Args:
@@ -55,18 +39,11 @@ class ContractModule:
         Returns:
             Contract | None: Created contract on success, otherwise None.
         """
-        payload = self._space_client._request_json("POST", "/contracts", json=contract_to_create.to_dict())
-        if payload is None:
-            return None
+        return self._run(operations.add_contract(contract_to_create))
 
-        contract = Contract.from_dict(payload)
-        cache = self._space_client.cache
-        if cache.is_enabled() and contract.user_id is not None:
-            cache.invalidate_user(contract.user_id)
-            cache.set(cache.get_contract_key(contract.user_id), payload)
-        return contract
-
-    def update_contract_subscription(self, user_id: str, new_subscription: Subscription) -> Contract | None:
+    def update_contract_subscription(
+        self, user_id: str, new_subscription: Subscription
+    ) -> Result[Contract | None]:
         """Update subscription for a single user.
 
         Args:
@@ -76,26 +53,13 @@ class ContractModule:
         Returns:
             Contract | None: Updated contract on success, otherwise None.
         """
-        payload = self._space_client._request_json(
-            "PUT",
-            f"/contracts/{user_id}",
-            json=new_subscription.to_dict(),
-        )
-        if payload is None:
-            return None
-
-        contract = Contract.from_dict(payload)
-        cache = self._space_client.cache
-        if cache.is_enabled():
-            cache.invalidate_user(user_id)
-            cache.set(cache.get_contract_key(user_id), payload)
-        return contract
+        return self._run(operations.update_contract_subscription(user_id, new_subscription))
 
     def update_contract_subscription_by_group_id(
         self,
         group_id: str,
         new_subscription: Subscription,
-    ) -> list[Contract] | None:
+    ) -> Result[list[Contract] | None]:
         """Update subscription for every contract in a group.
 
         Args:
@@ -105,30 +69,16 @@ class ContractModule:
         Returns:
             list[Contract] | None: Updated contracts list on success, otherwise None.
         """
-        payload = self._space_client._request_json(
-            "PUT",
-            f"/contracts?groupId={group_id}",
-            json=new_subscription.to_dict(),
+        return self._run(
+            operations.update_contract_subscription_by_group_id(group_id, new_subscription)
         )
-        if payload is None or not isinstance(payload, list):
-            return None
-
-        contracts = [Contract.from_dict(item) for item in payload]
-        cache = self._space_client.cache
-        if cache.is_enabled():
-            for contract, raw in zip(contracts, payload):
-                if contract.user_id is None:
-                    continue
-                cache.invalidate_user(contract.user_id)
-                cache.set(cache.get_contract_key(contract.user_id), raw)
-        return contracts
 
     def update_contract_usage_levels(
         self,
         user_id: str,
         service_name: str,
         usage_levels_novations: dict[str, int | float],
-    ) -> Contract | None:
+    ) -> Result[Contract | None]:
         """Update usage levels for one user service.
 
         Args:
@@ -139,22 +89,11 @@ class ContractModule:
         Returns:
             Contract | None: Updated contract on success, otherwise None.
         """
-        payload = self._space_client._request_json(
-            "PUT",
-            f"/contracts/{user_id}/usageLevels",
-            json={service_name: usage_levels_novations},
+        return self._run(
+            operations.update_contract_usage_levels(user_id, service_name, usage_levels_novations)
         )
-        if payload is None:
-            return None
 
-        contract = Contract.from_dict(payload)
-        cache = self._space_client.cache
-        if cache.is_enabled():
-            cache.invalidate_user(user_id)
-            cache.set(cache.get_contract_key(user_id), payload)
-        return contract
-
-    def remove_contract(self, user_id: str) -> None:
+    def remove_contract(self, user_id: str) -> Result[None]:
         """Delete a user contract.
 
         Args:
@@ -163,11 +102,7 @@ class ContractModule:
         Returns:
             None: No value is returned.
         """
-        response_ok = self._space_client._request_no_content("DELETE", f"/contracts/{user_id}")
-        if not response_ok:
-            return
-        if self._space_client.cache.is_enabled():
-            self._space_client.cache.invalidate_user(user_id)
+        return self._run(operations.remove_contract(user_id))
 
     # Java compatibility aliases
     getContract = get_contract
@@ -176,3 +111,15 @@ class ContractModule:
     updateContractSubscriptionByGroupId = update_contract_subscription_by_group_id
     updateContractUsageLevels = update_contract_usage_levels
     removeContract = remove_contract
+
+
+class ContractModule(_ContractCalls, SyncRunner):
+    """Contract operations over the synchronous client."""
+
+
+class AsyncContractModule(_ContractCalls, AsyncRunner):
+    """Contract operations over the asynchronous client.
+
+    Same methods and same arguments as :class:`ContractModule`; every one of
+    them must be awaited.
+    """
