@@ -1,24 +1,23 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
-from ..types.models import EvaluationError, FeatureEvaluationResult
+from .. import _operations as operations
+from .._result import Result
+from ..types.models import FeatureEvaluationResult
+from ._runner import AsyncRunner, SyncRunner
 
-if TYPE_CHECKING:
-    from ..space_client import SpaceClient
 
+class _FeatureCalls:
+    """The feature calls, written once.
 
-class FeatureModule:
-    def __init__(self, space_client: "SpaceClient") -> None:
-        """Create feature operations module.
+    Each method says what to do and hands it to ``self._run``, which is the only
+    part that differs between the synchronous and asynchronous clients. On
+    :class:`FeatureModule` these methods return their value; on
+    :class:`AsyncFeatureModule` they return an awaitable of that value.
+    """
 
-        Args:
-            space_client (SpaceClient): Parent client used for transport and cache.
-
-        Returns:
-            None: Constructor only stores references.
-        """
-        self._space_client = space_client
+    _run: Any
 
     def evaluate(
         self,
@@ -27,7 +26,7 @@ class FeatureModule:
         expected_consumption: dict[str, int | float] | None = None,
         details: bool = False,
         server: bool = False,
-    ) -> FeatureEvaluationResult:
+    ) -> Result[FeatureEvaluationResult]:
         """Evaluate a feature for a user.
 
         Args:
@@ -41,48 +40,13 @@ class FeatureModule:
         Returns:
             FeatureEvaluationResult: Evaluation outcome, including optional error payload.
         """
-        expected_consumption = expected_consumption or {}
-        cache = self._space_client.cache
-        is_read_only = len(expected_consumption) == 0
-        cache_key = cache.get_feature_key(user_id, feature_id)
-
-        if is_read_only and cache.is_enabled():
-            cached = cache.get(cache_key, parser=FeatureEvaluationResult.from_dict)
-            if cached is not None:
-                return cached
-
-        query_params: list[str] = []
-        if details:
-            query_params.append("details=true")
-        if server:
-            query_params.append("server=true")
-        query = "?" + "&".join(query_params) if query_params else ""
-
-        payload = self._space_client._request_json(
-            "POST",
-            f"/features/{user_id}/{feature_id}{query}",
-            json=expected_consumption,
+        return self._run(
+            operations.evaluate(user_id, feature_id, expected_consumption, details, server)
         )
-        if payload is None:
-            return FeatureEvaluationResult(
-                eval=False,
-                used={},
-                limit={},
-                error=EvaluationError(code="IO_ERROR", message="Error while evaluating feature"),
-            )
 
-        result = FeatureEvaluationResult.from_dict(payload)
-
-        if is_read_only and cache.is_enabled():
-            cache.set(cache_key, payload, ttl=60)
-        elif cache.is_enabled():
-            cache.delete(cache_key)
-            cache.delete(cache.get_contract_key(user_id))
-            cache.delete(cache.get_pricing_token_key(user_id))
-
-        return result
-
-    def revert_evaluation(self, user_id: str, feature_id: str, revert_to_latest: bool = True) -> bool:
+    def revert_evaluation(
+        self, user_id: str, feature_id: str, revert_to_latest: bool = True
+    ) -> Result[bool]:
         """Revert usage changes done by a previous optimistic evaluation.
 
         Args:
@@ -93,23 +57,9 @@ class FeatureModule:
         Returns:
             bool: True when the revert request succeeds, otherwise False.
         """
-        success = self._space_client._request_no_content(
-            "POST",
-            f"/features/{user_id}?revert=true&latest={str(revert_to_latest).lower()}",
-            json={},
-        )
-        if not success:
-            return False
+        return self._run(operations.revert_evaluation(user_id, feature_id, revert_to_latest))
 
-        cache = self._space_client.cache
-        if cache.is_enabled():
-            cache.delete(cache.get_feature_key(user_id, feature_id))
-            cache.delete(cache.get_contract_key(user_id))
-            cache.delete(cache.get_pricing_token_key(user_id))
-
-        return True
-
-    def generate_user_pricing_token(self, user_id: str) -> str | None:
+    def generate_user_pricing_token(self, user_id: str) -> Result[str | None]:
         """Generate a pricing token for a user.
 
         Args:
@@ -118,24 +68,20 @@ class FeatureModule:
         Returns:
             str | None: Token string on success, otherwise None.
         """
-        cache = self._space_client.cache
-        cache_key = cache.get_pricing_token_key(user_id)
-
-        if cache.is_enabled():
-            cached = cache.get(cache_key)
-            if isinstance(cached, str):
-                return cached
-
-        payload = self._space_client._request_json("POST", f"/features/{user_id}/pricing-token", json={})
-        if payload is None:
-            return None
-
-        token = payload.get("pricingToken") if isinstance(payload, dict) else None
-        if cache.is_enabled() and token is not None:
-            cache.set(cache_key, token, ttl=900)
-
-        return token
+        return self._run(operations.generate_user_pricing_token(user_id))
 
     # Java compatibility aliases
     revertEvaluation = revert_evaluation
     generateUserPricingToken = generate_user_pricing_token
+
+
+class FeatureModule(_FeatureCalls, SyncRunner):
+    """Feature operations over the synchronous client."""
+
+
+class AsyncFeatureModule(_FeatureCalls, AsyncRunner):
+    """Feature operations over the asynchronous client.
+
+    Same methods and same arguments as :class:`FeatureModule`; every one of them
+    must be awaited.
+    """

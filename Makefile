@@ -1,15 +1,12 @@
-.PHONY: venv install dev test clean
+.PHONY: install dev test clean
 
-venv:
-	python -m venv .venv
-
-install: venv
-	. .venv/bin/activate && python -m pip install --upgrade pip && pip install -e ".[dev]"
+install:
+	uv sync --extra dev
 
 dev: install
 
 test:
-	. .venv/bin/activate && pytest
+	uv run pytest
 
 clean:
 	rm -rf .venv

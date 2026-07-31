@@ -11,6 +11,7 @@ Python client library for [Space](https://github.com/isa-group/space), a pricing
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start in 5 Minutes](#quick-start-in-5-minutes)
+- [Async Client](#async-client)
 - [Configuration](#configuration)
 - [API Overview](#api-overview)
 - [Data Models](#data-models)
@@ -24,6 +25,7 @@ Python client library for [Space](https://github.com/isa-group/space), a pricing
 ## What You Get
 
 - Simple API to connect to Space.
+- An asynchronous client for services that run in an event loop.
 - Contract lifecycle operations.
 - Feature evaluation with optional expected consumption.
 - Revert operation for optimistic usage updates.
@@ -72,6 +74,49 @@ print(f"Pricing token: {pricing_token}")
 
 client.close()
 ```
+
+## Async Client
+
+Entitlement checks sit on the request path: a service asks Space "may this user
+do this?" before serving a request. Made synchronously from inside an event
+loop, that call blocks every other request the process is serving for as long as
+it takes - including the full timeout, when Space is slow or unreachable.
+
+`AsyncSpaceClient` is the same client over `httpx.AsyncClient`. Same modules,
+same method names, same arguments, same exceptions; the calls are awaited.
+
+```python
+from space_client import SpaceClientFactory
+
+client = SpaceClientFactory.connect_async(
+	"http://localhost:3000",
+	"your-api-key",
+	10_000,
+)
+
+async with client as space:
+	result = await space.features.evaluate("user-123", "serviceA-featureX")
+	print(f"Feature enabled: {result.eval}")
+
+	token = await space.features.generate_user_pricing_token("user-123")
+	print(f"Pricing token: {token}")
+```
+
+Two differences, both consequences of running in a loop:
+
+- **The WebSocket is not opened by the constructor**, because a constructor
+  cannot await. Call `await client.connect()`, or use the client as an async
+  context manager as above, when you want pricing events. HTTP calls work
+  without it.
+- **Closing is awaited**: `await client.close()`, or leave the `async with`.
+
+Everything else - cache lookups and invalidation, request building, error
+handling - is shared code rather than a second copy, so the two clients cannot
+drift apart.
+
+The cache providers remain synchronous. An in-memory lookup is not worth an
+await; a Redis one is a short local round trip, so if you are caching in Redis
+and want nothing at all blocking the loop, that is worth knowing.
 
 ## Configuration
 
@@ -122,6 +167,7 @@ client = SpaceClientFactory.connect(options)
 | `connect(options)` | Creates a client from full options and validates required inputs. |
 | `connect(url, api_key)` | Convenience overload with default timeout (`5000`). |
 | `connect(url, api_key, timeout)` | Convenience overload with custom timeout. |
+| `connect_async(...)` | Same arguments and same validation, returning an `AsyncSpaceClient`. |
 
 ### SpaceClient
 
@@ -144,6 +190,13 @@ Core methods:
 | `close()` | `None` | Closes sockets, cache provider, and HTTP resources. |
 
 Java-style aliases are also available (`isConnectedToSpace`, `removeListener`, `removeAllListeners`, etc.).
+
+### AsyncSpaceClient
+
+The same modules and the same methods, awaited. `is_connected_to_space()`,
+`connect()`, `disconnect()` and `close()` are coroutines; `on`,
+`remove_listener` and `remove_all_listeners` are not, since they only touch a
+local registry. Supports `async with`.
 
 ### ContractModule
 
@@ -243,8 +296,13 @@ client.connect()
 ## Error Handling
 
 - Factory validation raises `ValueError` for invalid input.
-- Runtime HTTP failures are converted to `None`/`False` return values where appropriate.
-- `FeatureModule.evaluate(...)` returns an object containing `error` when request handling fails.
+- A request Space refused raises `SpaceApiError`, carrying the status code, the
+  method and path, and whatever body came back.
+- A request that never arrived raises `SpaceConnectionError`.
+- `FeatureModule.evaluate(...)` returns an object containing `error` when Space
+  answers successfully with something that is not a usable evaluation.
+
+Both clients raise the same exceptions.
 
 ## Testing
 
