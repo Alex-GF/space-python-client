@@ -8,8 +8,24 @@ import socketio
 from .modules.cache_module import CacheModule
 from .modules.contract_module import ContractModule
 from .modules.feature_module import FeatureModule
+from .errors import SpaceApiError, SpaceConnectionError
 from .types.space_connection_options import SpaceConnectionOptions
 from .types.space_event import SpaceEvent
+
+
+def _read_body(response) -> Any:
+    """Whatever Space sent with a refusal, JSON if it parses and text if not.
+
+    Never raises: this runs while an error is being built, and failing here
+    would replace a useful message with a confusing one.
+    """
+    try:
+        return response.json()
+    except Exception:
+        try:
+            return response.text
+        except Exception:
+            return None
 
 
 class SpaceClient:
@@ -193,33 +209,54 @@ class SpaceClient:
         """
         return self._timeout
 
-    def _request_json(self, method: str, path: str, json: Any | None = None) -> dict[str, Any] | list[Any] | None:
+    def _send(self, method: str, path: str, json: Any | None = None):
+        """Make the request, or say why it could not be made.
+
+        A transport failure is not an answer, so it is raised rather than
+        folded into one: a caller that cannot reach Space has learnt something
+        different from a caller whose request was refused.
+        """
         url = f"{self._http_url}{path}"
         try:
-            response = self._http_client.request(
+            return self._http_client.request(
                 method,
                 url,
                 headers={"x-api-key": self._api_key},
                 json=json,
             )
-            if response.status_code < 200 or response.status_code >= 300:
-                return None
+        except Exception as error:
+            raise SpaceConnectionError(f"Could not reach Space at {url}: {error}") from error
+
+    def _request_json(self, method: str, path: str, json: Any | None = None) -> dict[str, Any] | list[Any] | None:
+        """The decoded body, or an exception saying what Space objected to.
+
+        ``None`` now means one thing - Space answered successfully with a body
+        that is not JSON - instead of standing in for a refusal, an outage and
+        an empty response at once.
+        """
+        response = self._send(method, path, json=json)
+
+        if response.status_code < 200 or response.status_code >= 300:
+            raise SpaceApiError(response.status_code, method, path, _read_body(response))
+
+        try:
             return response.json()
         except Exception:
             return None
 
     def _request_no_content(self, method: str, path: str, json: Any | None = None) -> bool:
-        url = f"{self._http_url}{path}"
-        try:
-            response = self._http_client.request(
-                method,
-                url,
-                headers={"x-api-key": self._api_key},
-                json=json,
-            )
-            return 200 <= response.status_code < 300
-        except Exception:
-            return False
+        """Whether Space accepted a request that returns nothing.
+
+        Still a boolean, because for these calls "did it work" is the whole
+        question - but a refusal now raises, so ``False`` is no longer the
+        answer to both "it declined" and "it never arrived".
+        """
+        response = self._send(method, path, json=json)
+
+        if response.status_code < 200 or response.status_code >= 300:
+            raise SpaceApiError(response.status_code, method, path, _read_body(response))
+
+        return True
 
     # Java compatibility aliases
     isConnectedToSpace = is_connected_to_space
