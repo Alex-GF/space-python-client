@@ -54,6 +54,13 @@ Optional Redis support:
 pip install "space-python-client[redis]"
 ```
 
+Optional verification of pricing tokens (PyJWT with `cryptography`, see
+[Verifying pricing tokens](#verifying-pricing-tokens)):
+
+```bash
+pip install "space-python-client[verify]"
+```
+
 ## Quick Start in 5 Minutes
 
 ```python
@@ -357,11 +364,15 @@ served from cache: its `contract_version` matters only while it is current.
 | `revert_consumption(user_id, feature_id, consumption_id, idempotency_key=None)` | `bool`: `True` reverted (now or before), `False` unknown or expired id (404) |
 | `revert_evaluation(user_id, feature_id, revert_to_latest=True, idempotency_key=None)` | `bool` (**deprecated**, emits `DeprecationWarning`: use `revert_consumption`) |
 | `generate_user_pricing_token(user_id)` | `str | None` |
+| `verify_pricing_token(token, organization_id=None, issuer=None, leeway=None)` | `PricingTokenPayload` |
 
 Java-style aliases are also available (`revertEvaluation`, `revertConsumption`, `generateUserPricingToken`).
 
 The writes in these tables carry an `Idempotency-Key`; see
 [Consumption, retries and Idempotency-Key](#consumption-retries-and-idempotency-key).
+
+Java-style aliases are also available (`revertEvaluation`, `generateUserPricingToken`,
+`verifyPricingToken`).
 
 ## Data Models
 
@@ -673,6 +684,62 @@ fits its limit, also under concurrency; one that does not fit answers
 Space's `CONSUMPTION_RETENTION_SECONDS` (24 h by default), and keys are
 remembered for `IDEMPOTENCY_KEY_TTL_SECONDS` (24 h by default).
 
+### Verifying pricing tokens
+
+Space versions with the capability `pricing-token-jwks` sign pricing tokens
+with ES256 and publish the public keys at
+`GET {url}/api/v1/.well-known/jwks.json` (no API key). A token that comes back
+to your backend (from a browser, a queue, another service) can then be verified
+with public material only. It needs the `verify` extra.
+
+```python
+payload = client.features.verify_pricing_token(token, organization_id="my-org-id")
+user_id = pricing_token_user_id(payload)
+```
+
+or, without a client:
+
+```python
+from space_client import PricingTokenVerifier
+
+verifier = PricingTokenVerifier("https://space.example.com", organization_id="my-org-id")
+payload = verifier.verify(token)
+```
+
+`AsyncPricingTokenVerifier` takes the same arguments and its `verify` is
+awaited; `AsyncSpaceClient.features.verify_pricing_token` is awaited too.
+
+What is checked:
+
+- The signature is ES256 by a key of the JWKS, chosen by the token's `kid`.
+  Any other `alg` (`HS256`, `none`, ...) is rejected, and so is a token with a
+  `jwk`, `jku`, `x5u` or `x5c` header: keys only come from the JWKS URL of your
+  Space.
+- `exp` is required and checked (`leeway`, in seconds, default 0).
+- `iss` equals `issuer` (the `JWT_ISSUER` of your Space, `space` by default).
+- `aud` and `organizationId` equal the expected organization. It is required:
+  pass `organization_id` to the call or to the verifier; the client uses its own
+  `organization_id` option when the call names none. A userId is only unique
+  within an organization, so a valid signature alone does not tell you the token
+  is for one of your users.
+
+The JWKS is cached for the `max-age` of its response (Space sends 5 minutes;
+5 minutes also without `Cache-Control`, nothing with `no-store`/`no-cache`) and
+fetched again when a token names a `kid` it does not know, at most once per
+`refetch_cooldown` (default 30 s), so key rotations need nothing on your side.
+Keep one verifier (or one client) and reuse it.
+
+Errors, all `PricingTokenVerificationError` (a `SpaceError`) with a `code`:
+`PricingTokenSignatureError` (forged or tampered token),
+`PricingTokenExpiredError` (`expired_at`), `PricingTokenAudienceError` (another
+organization), `PricingTokenIssuerError`, `PricingTokenUnknownKeyError` (`kid`
+not published, e.g. a removed key), and the base class with
+`PRICING_TOKEN_INVALID` (malformed token, wrong `alg`, forbidden header,
+missing claims) or `PRICING_TOKEN_JWKS_UNAVAILABLE` (the JWKS could not be
+fetched). A Space that does not publish its keys (older versions, or one in the
+deprecated `PRICING_TOKEN_ALG=HS256` mode) raises `SpaceFeatureUnsupportedError`
+with `capability == "pricing-token-jwks"`.
+
 ## Error Handling
 
 - Factory validation raises `ValueError` for invalid input.
@@ -707,6 +774,10 @@ remembered for `IDEMPOTENCY_KEY_TTL_SECONDS` (24 h by default).
 - `features.revert_consumption(...)` raises `SpaceFeatureUnsupportedError`
   (`capability == "atomic-usage-limits"`) without sending anything on a Space
   that cannot revert by id.
+
+- `features.verify_pricing_token(...)` and `PricingTokenVerifier.verify(...)`
+  raise `PricingTokenVerificationError` or one of its subclasses (see
+  [Verifying pricing tokens](#verifying-pricing-tokens)).
 - `FeatureModule.evaluate(...)` returns an object containing `error` when Space
   answers successfully with something that is not a usable evaluation.
 
