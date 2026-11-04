@@ -13,10 +13,31 @@ part that must differ.
 
 from __future__ import annotations
 
+import re
+import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Generator, Generic, TypeVar, Union
+from urllib.parse import quote
 
-from .types.models import Contract, ContractToCreate, EvaluationError, FeatureEvaluationResult, Subscription
+from .errors import (
+    ContractChangedError,
+    PricingYamlUnavailableError,
+    SpaceApiError,
+    SpaceFeatureUnsupportedError,
+)
+from .types.models import (
+    ConsumptionRevertResult,
+    Contract,
+    ContractPricings,
+    ContractToCreate,
+    EvaluationError,
+    FeatureEvaluationResult,
+    NewContractsPricing,
+    NovationPreview,
+    PricingYaml,
+    Subscription,
+)
 
 if TYPE_CHECKING:
     from .modules.cache_module import CacheModule
@@ -39,6 +60,24 @@ class Operation(Generic[T]):
             are safe to serve from cache.
         parse: Turns what came back into the caller's result, and applies
             whatever the answer implies for the cache.
+        headers: Extra request headers (``If-None-Match``, ``If-Match``...).
+        raw: True when the answer is more than a JSON body - a YAML file, an
+            ``ETag`` header, a 304 - in which case ``parse`` receives the HTTP
+            response itself instead of the decoded body.
+        accept: Statuses outside 2xx that are answers rather than refusals
+            (``304 Not Modified``). Only meaningful with ``raw``.
+        on_refusal: Called with the :class:`SpaceApiError` when Space refuses;
+            it may raise a more specific error (which must still be a
+            ``SpaceApiError``) or return to let the generic one propagate.
+        idempotency_key: Set on the writes Space can apply at most once: sent
+            as ``Idempotency-Key``, the same on every attempt. The runners
+            retry these operations (and only these) per the client's
+            ``retries`` and map Space's idempotency refusals to typed errors.
+        explicit_key: True when the key is the caller's: the runner checks it
+            and makes sure Space supports ``idempotency-key`` before sending.
+        requires: ``(capability, what)`` pairs the runner checks before
+            sending; a missing one raises ``SpaceFeatureUnsupportedError`` and
+            nothing is written.
     """
 
     method: str
@@ -49,6 +88,96 @@ class Operation(Generic[T]):
     parse: Callable[["CacheModule", Any], T] = field(
         default=lambda _cache, payload: payload  # type: ignore[assignment,return-value]
     )
+    headers: dict[str, str] | None = None
+    raw: bool = False
+    accept: frozenset[int] = frozenset()
+    on_refusal: Callable[["CacheModule", SpaceApiError], None] | None = None
+    idempotency_key: str | None = None
+    explicit_key: bool = False
+    requires: tuple[tuple[str, str], ...] = ()
+
+
+Flow = Generator[Operation[Any], Any, T]
+"""Several requests that make one call: yields each operation, receives its
+result, returns the call's result. Used when what to ask next depends on the
+previous answer (a capability check before a write). The runners drive it, so
+it too is written once for both clients."""
+
+Work = Union[Operation[T], Flow[T]]
+
+Capabilities = Callable[[], "frozenset[str] | None"]
+"""The ``X-Space-Capabilities`` tokens this client saw recently, or None when
+it has to ask again (see ``BaseSpaceClient.CAPABILITIES_TTL_SECONDS``)."""
+
+
+def _no_capabilities() -> "frozenset[str] | None":
+    return None
+
+
+# S0 tokens the client depends on.
+PRICING_YAML = "pricing-yaml"
+CONTRACT_VERSION = "contract-version"
+KEEP_BILLING_PERIOD = "keep-billing-period"
+REJECT_PRIVATE = "reject-private"
+IDEMPOTENCY_KEY = "idempotency-key"
+ATOMIC_USAGE_LIMITS = "atomic-usage-limits"
+
+_OPTION_OF = {
+    CONTRACT_VERSION: "expected_contract_version (If-Match)",
+    KEEP_BILLING_PERIOD: "keep_billing_period",
+    REJECT_PRIVATE: "reject_private",
+}
+
+
+class _Unset:
+    """Default of ``expected_contract_version``: told apart from an explicit None."""
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET: Any = _Unset()
+
+
+def _key(idempotency_key: str | None) -> tuple[str, bool]:
+    """The ``Idempotency-Key`` of one operation: the caller's, or a new UUID v4.
+
+    Made once, when the operation is built, so the runner's retries reuse it.
+    """
+    if idempotency_key is None:
+        return str(uuid.uuid4()), False
+    return idempotency_key, True
+
+
+def _segment(value: str) -> str:
+    """One path segment, escaped: a version like ``v1/2`` must stay one segment."""
+    return quote(str(value), safe="")
+
+
+def _quote_etag(etag: str) -> str:
+    """Entity tags travel quoted; accept them from callers either way."""
+    if re.fullmatch(r'(W/)?".*"', etag):
+        return etag
+    return f'"{etag}"'
+
+
+def _unquote_etag(etag: str) -> str:
+    return re.sub(r'^(W/)?"(.*)"$', r"\2", etag)
+
+
+def _response_headers(response: Any) -> Any:
+    return getattr(response, "headers", None) or {}
+
+
+def _decode(response: Any) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _error_code(payload: Any) -> str | None:
+    return payload.get("error") if isinstance(payload, dict) else None
 
 
 # --------------------------------------------------------------------------
@@ -71,7 +200,9 @@ def get_contract(user_id: str) -> Operation[Contract | None]:
     return Operation("GET", f"/contracts/{user_id}", cache_hit=hit, parse=parse)
 
 
-def add_contract(contract_to_create: ContractToCreate) -> Operation[Contract | None]:
+def add_contract(
+    contract_to_create: ContractToCreate, idempotency_key: str | None = None
+) -> Operation[Contract | None]:
     def parse(cache: "CacheModule", payload: Any) -> Contract | None:
         if payload is None:
             return None
@@ -81,21 +212,287 @@ def add_contract(contract_to_create: ContractToCreate) -> Operation[Contract | N
             cache.set(cache.get_contract_key(contract.user_id), payload)
         return contract
 
-    return Operation("POST", "/contracts", json=contract_to_create.to_dict(), parse=parse)
+    key, explicit = _key(idempotency_key)
+    return Operation(
+        "POST",
+        "/contracts",
+        json=contract_to_create.to_dict(),
+        parse=parse,
+        idempotency_key=key,
+        explicit_key=explicit,
+    )
 
 
-def update_contract_subscription(user_id: str, new_subscription: Subscription) -> Operation[Contract | None]:
+def update_contract_subscription(
+    user_id: str,
+    new_subscription: Subscription,
+    expected_contract_version: Any = UNSET,
+    keep_billing_period: bool = False,
+    capabilities: Capabilities = _no_capabilities,
+    reject_private: bool = False,
+    idempotency_key: str | None = None,
+) -> Work[Contract | None]:
+    """The novation, guarded when the caller asked for a guarantee (S0).
+
+    Without options it is the single PUT it always was. With
+    ``expected_contract_version``, ``keep_billing_period`` or ``reject_private``
+    the client first makes sure Space advertises ``contract-version`` /
+    ``keep-billing-period`` / ``reject-private``
+    (reading the contract once when it does not know), refuses without writing
+    if it does not, and checks the answer for signs the option was ignored.
+    """
+    conditional = expected_contract_version is not UNSET
+    if conditional and (not isinstance(expected_contract_version, str) or not expected_contract_version):
+        # None here is almost always a version that was never known (a
+        # preview from an old Space): sending no If-Match would turn a
+        # conditional update into an unconditional one. Raised from the flow,
+        # so the async client raises it when awaited, like any other error.
+        return _refuse_empty_version()
+    expected: str | None = expected_contract_version if conditional else None
+
+    required = [
+        capability
+        for capability, wanted in (
+            (CONTRACT_VERSION, conditional),
+            (KEEP_BILLING_PERIOD, keep_billing_period),
+            (REJECT_PRIVATE, reject_private),
+        )
+        if wanted
+    ]
+    key = _key(idempotency_key)
+    if not required:
+        return _novation_put(user_id, new_subscription, None, False, key=key)
+    return _guarded_novation(
+        user_id, new_subscription, expected, keep_billing_period, required, capabilities, reject_private, key
+    )
+
+
+def _refuse_empty_version() -> Flow[Contract | None]:
+    raise ValueError(
+        "expected_contract_version must be a non-empty contract version; "
+        "leave it out for an unconditional update"
+    )
+    yield  # pragma: no cover - makes this a generator
+
+
+def _guarded_novation(
+    user_id: str,
+    new_subscription: Subscription,
+    expected: str | None,
+    keep_billing_period: bool,
+    required: list[str],
+    capabilities: Capabilities,
+    reject_private: bool = False,
+    key: tuple[str, bool] | None = None,
+) -> Flow[Contract | None]:
+    before: Contract | None = None
+    known = capabilities()
+    if known is None:
+        # The answer carries the capabilities, and its ETag lets a stale
+        # expected version fail before anything is written.
+        before = yield _novation_probe(user_id, expected, required, capabilities)
+    else:
+        _require(required, known)
+    return (
+        yield _novation_put(user_id, new_subscription, expected, keep_billing_period, before, reject_private, key)
+    )
+
+
+def _require(required: list[str], known: "frozenset[str]") -> None:
+    for capability in required:
+        if capability not in known:
+            raise SpaceFeatureUnsupportedError(
+                capability,
+                f"The connected Space does not support {_OPTION_OF[capability]}: nothing was written",
+            )
+
+
+def _novation_probe(
+    user_id: str, expected: str | None, required: list[str], capabilities: Capabilities
+) -> Operation[Contract]:
+    path = f"/contracts/{user_id}"
+
+    def parse(cache: "CacheModule", response: Any) -> Contract:
+        _require(required, capabilities() or frozenset())
+        payload = _decode(response)
+        payload = payload if isinstance(payload, dict) else {}
+        etag = _response_headers(response).get("etag")
+        current = _unquote_etag(etag) if etag else payload.get("contractVersion")
+        if expected is not None and current is not None and current != _unquote_etag(expected):
+            # Early and not atomic; If-Match on the PUT stays the real check.
+            if cache.is_enabled():
+                cache.invalidate_user(user_id)
+            raise ContractChangedError(
+                412,
+                "GET",
+                path,
+                {"error": ContractChangedError.code, "contractVersion": current},
+                user_id=user_id,
+                expected_contract_version=expected,
+                contract_version=current,
+            )
+        return Contract.from_dict(payload)
+
+    return Operation("GET", path, raw=True, parse=parse)
+
+
+def _novation_put(
+    user_id: str,
+    new_subscription: Subscription,
+    expected: str | None,
+    keep_billing_period: bool,
+    before: Contract | None = None,
+    reject_private: bool = False,
+    key: tuple[str, bool] | None = None,
+) -> Operation[Contract | None]:
+    idempotency_key, explicit = key if key is not None else _key(None)
+    headers: dict[str, str] | None = None
+    if expected is not None:
+        headers = {"If-Match": _quote_etag(expected)}
+
+    replace = _replace_one(user_id)
+
+    def parse(cache: "CacheModule", response: Any) -> Contract | None:
+        payload = _decode(response)
+        # Servers that send the version only as an ETag still fill it in.
+        etag = _response_headers(response).get("etag")
+        if isinstance(payload, dict) and payload.get("contractVersion") is None and etag:
+            payload = {**payload, "contractVersion": _unquote_etag(etag)}
+        if expected is not None or keep_billing_period:
+            ignored = _ignored_option(expected, keep_billing_period, etag, payload, before)
+            if ignored is not None:
+                # Space wrote the novation without the guarantee. Say so, and
+                # keep nothing cached for a contract in a state nobody chose.
+                if cache.is_enabled():
+                    cache.invalidate_user(user_id)
+                capability, message = ignored
+                raise SpaceFeatureUnsupportedError(
+                    capability,
+                    message,
+                    written=True,
+                    contract=Contract.from_dict(payload) if isinstance(payload, dict) else None,
+                )
+        return replace(cache, payload)
+
+    def on_refusal(cache: "CacheModule", error: SpaceApiError) -> None:
+        if error.status_code == 412:
+            # Whatever we hold for this user is known to be stale.
+            if cache.is_enabled():
+                cache.invalidate_user(user_id)
+            raise ContractChangedError.from_error(error, user_id, expected)
+
+    # The path is left unescaped, as it always was for this call, so that
+    # callers relying on the old URL see no change.
     return Operation(
         "PUT",
-        f"/contracts/{user_id}",
+        f"/contracts/{user_id}{_novation_query(keep_billing_period, reject_private)}",
         json=new_subscription.to_dict(),
-        parse=_replace_one(user_id),
+        headers=headers,
+        raw=True,
+        parse=parse,
+        on_refusal=on_refusal,
+        idempotency_key=idempotency_key,
+        explicit_key=explicit,
     )
+
+
+def _ignored_option(
+    expected: str | None,
+    keep_billing_period: bool,
+    etag: str | None,
+    payload: Any,
+    before: Contract | None,
+) -> tuple[str, str] | None:
+    """Post-write backstop: does the stored contract show an option was ignored?"""
+    if expected is not None and not etag:
+        return (
+            CONTRACT_VERSION,
+            (
+                "Space applied the novation without an ETag: If-Match (expected_contract_version) "
+                "was not enforced"
+            ),
+        )
+    if keep_billing_period and isinstance(payload, dict):
+        after = Contract.from_dict(payload)
+        previous = before.billing_period.start_date if before and before.billing_period else None
+        if previous is None and after.history:
+            # Space records the replaced period in the history entry it pushes.
+            previous = after.history[-1].start_date
+        current = after.billing_period.start_date if after.billing_period else None
+        if previous is not None and current is not None and not _same_instant(previous, current):
+            return (
+                KEEP_BILLING_PERIOD,
+                (
+                    "Space applied the novation but restarted the billing period "
+                    "(keep_billing_period was ignored)"
+                ),
+            )
+    return None
+
+
+def _same_instant(a: Any, b: Any) -> bool:
+    def parse(value: Any) -> Any:
+        if isinstance(value, datetime):
+            moment = value
+        else:
+            try:
+                moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return str(value)
+        return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+    first, second = parse(a), parse(b)
+    if isinstance(first, datetime) and isinstance(second, datetime):
+        return first == second
+    return str(a) == str(b)
+
+
+def preview_novation(
+    user_id: str,
+    new_subscription: Subscription,
+    keep_billing_period: bool = False,
+    capabilities: Capabilities = _no_capabilities,
+    reject_private: bool = False,
+) -> Operation[NovationPreview]:
+    body = new_subscription.to_dict()
+    if not body.get("contractedServices"):
+        # Omitted means "keep the current versions or let the policy decide".
+        body.pop("contractedServices", None)
+
+    # A dry run writes nothing, so it leaves the cache alone.
+    def parse(_cache: "CacheModule", payload: Any) -> NovationPreview:
+        known = capabilities() or frozenset()
+        # The preview would describe something the caller asked to avoid: a
+        # restarted period, or a private plan accepted.
+        for capability, wanted in ((KEEP_BILLING_PERIOD, keep_billing_period), (REJECT_PRIVATE, reject_private)):
+            if wanted and capability not in known:
+                raise SpaceFeatureUnsupportedError(
+                    capability,
+                    f"The connected Space does not support {_OPTION_OF[capability]}: the preview ignored it",
+                )
+        return NovationPreview.from_dict(payload if isinstance(payload, dict) else {})
+
+    return Operation(
+        "POST",
+        f"/contracts/{_segment(user_id)}/novation/preview{_novation_query(keep_billing_period, reject_private)}",
+        json=body,
+        parse=parse,
+    )
+
+
+def _novation_query(keep_billing_period: bool, reject_private: bool = False) -> str:
+    params = [
+        name
+        for name, wanted in (("keepBillingPeriod=true", keep_billing_period), ("rejectPrivate=true", reject_private))
+        if wanted
+    ]
+    return "?" + "&".join(params) if params else ""
 
 
 def update_contract_subscription_by_group_id(
     group_id: str,
     new_subscription: Subscription,
+    idempotency_key: str | None = None,
 ) -> Operation[list[Contract] | None]:
     def parse(cache: "CacheModule", payload: Any) -> list[Contract] | None:
         if payload is None or not isinstance(payload, list):
@@ -109,11 +506,14 @@ def update_contract_subscription_by_group_id(
                 cache.set(cache.get_contract_key(contract.user_id), raw)
         return contracts
 
+    key, explicit = _key(idempotency_key)
     return Operation(
         "PUT",
         f"/contracts?groupId={group_id}",
         json=new_subscription.to_dict(),
         parse=parse,
+        idempotency_key=key,
+        explicit_key=explicit,
     )
 
 
@@ -121,12 +521,16 @@ def update_contract_usage_levels(
     user_id: str,
     service_name: str,
     usage_levels_novations: dict[str, int | float],
+    idempotency_key: str | None = None,
 ) -> Operation[Contract | None]:
+    key, explicit = _key(idempotency_key)
     return Operation(
         "PUT",
         f"/contracts/{user_id}/usageLevels",
         json={service_name: usage_levels_novations},
         parse=_replace_one(user_id),
+        idempotency_key=key,
+        explicit_key=explicit,
     )
 
 
@@ -139,6 +543,15 @@ def remove_contract(user_id: str) -> Operation[None]:
         return None
 
     return Operation("DELETE", f"/contracts/{user_id}", no_content=True, parse=parse)
+
+
+def get_contract_pricings(user_id: str) -> Operation[ContractPricings]:
+    # Never cached: the point of the answer is its contractVersion, which is
+    # only useful while it is current.
+    def parse(_cache: "CacheModule", payload: Any) -> ContractPricings:
+        return ContractPricings.from_dict(payload if isinstance(payload, dict) else {})
+
+    return Operation("GET", f"/contracts/{_segment(user_id)}/pricings", parse=parse)
 
 
 def _replace_one(user_id: str) -> Callable[["CacheModule", Any], Contract | None]:
@@ -157,6 +570,79 @@ def _replace_one(user_id: str) -> Callable[["CacheModule", Any], Contract | None
 
 
 # --------------------------------------------------------------------------
+# Pricings and services
+# --------------------------------------------------------------------------
+
+
+_YAML_MEDIA_TYPES = frozenset(
+    {"application/yaml", "text/yaml", "application/x-yaml", "text/x-yaml"}
+)
+
+
+def _media_type(response: Any) -> str:
+    content_type = response.headers.get("content-type") or ""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def get_pricing_yaml(
+    service_name: str, pricing_version: str, etag: str | None = None
+) -> Operation[PricingYaml]:
+    headers = {"Accept": "application/yaml"}
+    if etag:
+        headers["If-None-Match"] = _quote_etag(etag)
+
+    def parse(_cache: "CacheModule", response: Any) -> PricingYaml:
+        received_etag = response.headers.get("etag")
+        syntax_version = response.headers.get("x-pricing-syntax-version")
+        if response.status_code == 304:
+            return PricingYaml(
+                yaml=None,
+                etag=received_etag or (_quote_etag(etag) if etag else None),
+                syntax_version=syntax_version,
+                not_modified=True,
+            )
+        media_type = _media_type(response)
+        if media_type not in _YAML_MEDIA_TYPES:
+            # Space without S2 ignores ?format=yaml and answers with the JSON
+            # pricing: that is not the file, so do not hand it out as one.
+            raise SpaceFeatureUnsupportedError(
+                PRICING_YAML,
+                f"Space answered {media_type or 'without a Content-Type'} for "
+                f"{service_name}@{pricing_version}: this Space version does not support "
+                "format=yaml",
+            )
+        return PricingYaml(
+            yaml=response.text,
+            etag=received_etag,
+            syntax_version=syntax_version,
+            not_modified=False,
+        )
+
+    def on_refusal(_cache: "CacheModule", error: SpaceApiError) -> None:
+        if error.status_code == 404 and _error_code(error.payload) == "PRICING_YAML_UNAVAILABLE":
+            raise PricingYamlUnavailableError.from_error(error, service_name, pricing_version)
+
+    return Operation(
+        "GET",
+        f"/services/{_segment(service_name)}/pricings/{_segment(pricing_version)}?format=yaml",
+        headers=headers,
+        raw=True,
+        accept=frozenset({304}),
+        parse=parse,
+        on_refusal=on_refusal,
+    )
+
+
+def get_new_contracts_pricing(service_name: str) -> Operation[NewContractsPricing]:
+    def parse(_cache: "CacheModule", payload: Any) -> NewContractsPricing:
+        return NewContractsPricing.from_dict(payload if isinstance(payload, dict) else {})
+
+    return Operation(
+        "GET", f"/services/{_segment(service_name)}/pricings/new-contracts", parse=parse
+    )
+
+
+# --------------------------------------------------------------------------
 # Features
 # --------------------------------------------------------------------------
 
@@ -167,6 +653,7 @@ def evaluate(
     expected_consumption: dict[str, int | float] | None = None,
     details: bool = False,
     server: bool = False,
+    idempotency_key: str | None = None,
 ) -> Operation[FeatureEvaluationResult]:
     expected_consumption = expected_consumption or {}
 
@@ -210,32 +697,99 @@ def evaluate(
         query_params.append("server=true")
     query = "?" + "&".join(query_params) if query_params else ""
 
+    # Only a consumption is a write: Space ignores the key on the others, and
+    # they are never retried.
+    key: str | None = None
+    explicit = False
+    if not is_read_only:
+        key, explicit = _key(idempotency_key)
     return Operation(
         "POST",
         f"/features/{user_id}/{feature_id}{query}",
         json=expected_consumption,
         cache_hit=hit,
         parse=parse,
+        idempotency_key=key,
+        explicit_key=explicit,
     )
 
 
-def revert_evaluation(user_id: str, feature_id: str, revert_to_latest: bool = True) -> Operation[bool]:
+def _forget_usage(cache: "CacheModule", user_id: str, feature_id: str) -> None:
+    if cache.is_enabled():
+        cache.delete(cache.get_feature_key(user_id, feature_id))
+        cache.delete(cache.get_contract_key(user_id))
+        cache.delete(cache.get_pricing_token_key(user_id))
+
+
+def revert_evaluation(
+    user_id: str,
+    feature_id: str,
+    revert_to_latest: bool = True,
+    idempotency_key: str | None = None,
+) -> Operation[bool]:
     def parse(cache: "CacheModule", accepted: Any) -> bool:
         if not accepted:
             return False
-        if cache.is_enabled():
-            cache.delete(cache.get_feature_key(user_id, feature_id))
-            cache.delete(cache.get_contract_key(user_id))
-            cache.delete(cache.get_pricing_token_key(user_id))
+        _forget_usage(cache, user_id, feature_id)
         return True
 
+    # On the feature route: ``/features/{userId}`` evaluates every feature and
+    # reverts nothing, which is where this call used to go.
+    key, explicit = _key(idempotency_key)
     return Operation(
         "POST",
-        f"/features/{user_id}?revert=true&latest={str(revert_to_latest).lower()}",
+        f"/features/{user_id}/{feature_id}?revert=true&latest={str(revert_to_latest).lower()}",
         json={},
         no_content=True,
         parse=parse,
+        idempotency_key=key,
+        explicit_key=explicit,
     )
+
+
+def revert_consumption(
+    user_id: str,
+    feature_id: str,
+    consumption_id: str,
+    idempotency_key: str | None = None,
+    detailed: bool = False,
+) -> Work[bool]:
+    """Revert exactly the consumption Space reported as ``consumptionId``.
+
+    True on ``204`` (reverted now or before), False on ``404`` (Space does not
+    know it). Needs ``atomic-usage-limits``: an older Space ignores the id and
+    restores a cached snapshot of the level instead.
+    """
+    if not isinstance(consumption_id, str) or not 1 <= len(consumption_id) <= 255:
+        return _refuse_consumption_id()
+
+    def parse(cache: "CacheModule", response: Any) -> bool:
+        if getattr(response, "status_code", 200) == 404:
+            return ConsumptionRevertResult(consumption_id, False) if detailed else False
+        _forget_usage(cache, user_id, feature_id)
+        if detailed:
+            payload = response.json() if response.status_code == 200 else {}
+            return ConsumptionRevertResult(consumption_id, True, payload.get("reverted"), list(payload.get("skipped", [])))
+        return True
+
+    key, explicit = _key(idempotency_key)
+    return Operation(
+        "POST",
+        f"/features/{_segment(user_id)}/{_segment(feature_id)}"
+        f"?revert=true&consumptionId={quote(consumption_id, safe='')}",
+        json={},
+        raw=True,
+        accept=frozenset({404}),
+        parse=parse,
+        idempotency_key=key,
+        explicit_key=explicit,
+        requires=((ATOMIC_USAGE_LIMITS, "revert by consumption_id"),),
+    )
+
+
+def _refuse_consumption_id() -> Flow[bool]:
+    raise ValueError("consumption_id must be a string of 1 to 255 characters")
+    yield  # pragma: no cover - makes this a generator
 
 
 def generate_user_pricing_token(user_id: str) -> Operation[str | None]:

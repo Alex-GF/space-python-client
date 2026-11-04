@@ -1,5 +1,30 @@
 # Space Python Client
 
+## Release 1.1.0
+
+This minor release preserves existing public methods and adds subscription reads, contract events,
+multiorganization token claims, event deduplication and JWKS verification. Backend SDKs also
+provide pricing YAML reads, novation previews, optimistic concurrency and opt-in idempotent retries.
+Use a SPACE server advertising the required `X-Space-Capabilities`; merging server changes alone
+does not deploy them. Read `userId` through the provided helper: `sub` is opaque.
+
+### Detailed consumption reversions
+
+`features.revert_consumption_details(user_id, feature_id, consumption_id, idempotency_key=None)` preserves the server's refund details. The existing boolean
+`revertConsumption` / `revert_consumption` remains available and unchanged.
+
+| SPACE response | Detailed result |
+| --- | --- |
+| 204 | Found; nothing omitted. No per-limit amounts were returned (`reverted` is absent/null). |
+| 200 | Found; `reverted` contains amounts and `skipped` identifies limits which no longer exist. |
+| 404 | Not found; nothing was changed by this request. |
+| 409 | An API error is propagated, including a disabled service or `IDEMPOTENCY_STATE_CHANGED`; no automatic retry. |
+
+The result is `ConsumptionRevertResult`: consumption ID, `found`, optional `reverted` amounts and
+`skipped` limit IDs (Python uses `consumption_id`; Java uses getters and `isFound()`). To retry one
+operation across process restarts, store and reuse its idempotency key. A new key means a new operation.
+A successful signature still requires the application to match the token's user to its authenticated user.
+
 Python client library for [Space](https://github.com/isa-group/space), a pricing-driven self-adaptation platform for SaaS applications.
 
 [![PyPI](https://img.shields.io/pypi/v/space-python-client.svg)](https://pypi.org/project/space-python-client)
@@ -17,6 +42,8 @@ Python client library for [Space](https://github.com/isa-group/space), a pricing
 - [Data Models](#data-models)
 - [Caching](#caching)
 - [WebSocket Events](#websocket-events)
+- [Pricing Tokens](#pricing-tokens)
+- [Consumption, retries and Idempotency-Key](#consumption-retries-and-idempotency-key)
 - [Error Handling](#error-handling)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -30,8 +57,11 @@ Python client library for [Space](https://github.com/isa-group/space), a pricing
 - Feature evaluation with optional expected consumption.
 - Revert operation for optimistic usage updates.
 - Pricing token generation.
+- Pricing reads for pricing pages: the raw Pricing2Yaml of a version, the
+  versions of a user's contract, and the version new contracts get.
 - Built-in in-memory cache and optional Redis cache.
-- WebSocket events for real-time pricing updates.
+- WebSocket events for real-time pricing updates, and contract events for the
+  API key's organisation.
 
 ## Requirements
 
@@ -47,6 +77,13 @@ Optional Redis support:
 
 ```bash
 pip install "space-python-client[redis]"
+```
+
+Optional verification of pricing tokens (PyJWT with `cryptography`, see
+[Verifying pricing tokens](#verifying-pricing-tokens)):
+
+```bash
+pip install "space-python-client[verify]"
 ```
 
 ## Quick Start in 5 Minutes
@@ -175,6 +212,8 @@ Main entry point. Exposes modules as public fields:
 
 - `contracts`
 - `features`
+- `pricings`
+- `services`
 - `cache`
 
 Core methods:
@@ -182,6 +221,7 @@ Core methods:
 | Method | Returns | Details |
 |---|---|---|
 | `is_connected_to_space()` | `bool` | HTTP health check against `/healthcheck`. |
+| `has_capability(token)` | `bool` | Whether Space advertises an `X-Space-Capabilities` token (`idempotency-key`, `atomic-usage-limits`...), from a recent response or `GET /healthcheck`. |
 | `on(event, callback)` | `None` | Registers event callback for supported event names. |
 | `remove_listener(event)` | `None` | Removes one callback by event name. |
 | `remove_all_listeners()` | `None` | Removes all event callbacks. |
@@ -203,23 +243,158 @@ local registry. Supports `async with`.
 | Method | Returns |
 |---|---|
 | `get_contract(user_id)` | `Contract | None` |
-| `add_contract(contract_to_create)` | `Contract | None` |
-| `update_contract_subscription(user_id, new_subscription)` | `Contract | None` |
-| `update_contract_subscription_by_group_id(group_id, new_subscription)` | `list[Contract] | None` |
-| `update_contract_usage_levels(user_id, service_name, usage_levels_novations)` | `Contract | None` |
+| `add_contract(contract_to_create, idempotency_key=None)` | `Contract | None` |
+| `update_contract_subscription(user_id, new_subscription, expected_contract_version=<unset>, keep_billing_period=False, reject_private=False, idempotency_key=None)` | `Contract | None` |
+| `update_contract_subscription_by_group_id(group_id, new_subscription, idempotency_key=None)` | `list[Contract] | None` |
+| `update_contract_usage_levels(user_id, service_name, usage_levels_novations, idempotency_key=None)` | `Contract | None` |
 | `remove_contract(user_id)` | `None` |
+| `get_pricings(user_id)` | `ContractPricings` |
+| `preview_novation(user_id, new_subscription, keep_billing_period=False, reject_private=False)` | `NovationPreview` |
 
 Java-style aliases are also available (`getContract`, `addContract`, etc.).
+
+### PricingModule
+
+| Method | Returns |
+|---|---|
+| `get_yaml(service_name, pricing_version, etag=None)` | `PricingYaml` |
+
+### ServiceModule
+
+| Method | Returns |
+|---|---|
+| `get_new_contracts_pricing(service_name)` | `NewContractsPricing` |
+
+### Pricing pages
+
+A host backend renders a pricing page with the version a visitor would get, or
+with the version a signed-in customer is on:
+
+```python
+# Signed-out visitor: the version SPACE assigns to new contracts.
+current = client.services.get_new_contracts_pricing("acme")
+pricing = client.pricings.get_yaml("acme", current.version)
+print(current.source)  # "sphere-policy" | "default" | "latest-active"
+
+# Signed-in customer: the version of THEIR contract.
+mine = client.contracts.get_pricings("user-123")
+acme = mine.services["acme"]
+print(acme.version, acme.status, acme.plan, acme.add_ons, acme.new_contracts_version)
+pricing = client.pricings.get_yaml("acme", acme.version)
+
+# The file is returned byte for byte; keep its ETag to revalidate cheaply.
+again = client.pricings.get_yaml("acme", acme.version, etag=pricing.etag)
+if again.not_modified:
+	...  # reuse pricing.yaml
+```
+
+### Changing a subscription safely
+
+Preview first, then apply with the `contract_version` the preview was computed
+on. If anything changed the contract in between, Space refuses with 412 and the
+client raises `ContractChangedError` instead of overwriting it:
+
+```python
+from space_client import ContractChangedError, SpaceFeatureUnsupportedError
+from space_client.types import NovationErrorCode, Subscription
+
+change = Subscription(
+	subscription_plans={"acme": "growth"},
+	subscription_add_ons={"acme": {"extraStorage": 2}},
+)  # contracted_services left empty: keep the versions or let the policy decide
+
+preview = client.contracts.preview_novation("user-123", change, keep_billing_period=True)
+if not preview.valid:
+	for error in preview.errors:
+		if error.code == NovationErrorCode.ADDON_NOT_AVAILABLE:
+			...
+		print(error.code, error.service, error.path, error.message)
+else:
+	print(preview.effective, preview.version_changes, preview.usage_warnings)
+	try:
+		client.contracts.update_contract_subscription(
+			"user-123",
+			preview.effective,
+			expected_contract_version=preview.contract_version,
+			keep_billing_period=True,
+		)
+	except ContractChangedError as changed:
+		print("Changed meanwhile; current version is", changed.contract_version)
+	except SpaceFeatureUnsupportedError as unsupported:
+		# This Space cannot honour the option (unsupported.capability).
+		if unsupported.written:
+			...  # the change WAS applied without the guarantee: unsupported.contract
+		else:
+			...  # nothing was written
+```
+
+- `preview_novation` writes nothing and leaves the cache alone. An invalid
+  change is an answer (`valid=False`, `errors`), not an exception. Unknown error
+  codes are kept as strings.
+- `expected_contract_version` is sent as `If-Match`. Leave it out for an
+  unconditional update, exactly as before. Passing `None` or `""` raises
+  `ValueError` without sending anything: a version that was never known must not
+  quietly turn a conditional update into an unconditional one.
+- `keep_billing_period=True` sends `?keepBillingPeriod=true`: history is still
+  recorded but the billing period is not restarted.
+- `reject_private=True` (on both calls) sends `?rejectPrivate=true`, asking
+  Space to refuse private plans and add-ons. Rejection is opt-in: without it
+  Space accepts them, as before.
+- `Contract.contract_version` is filled from the body or, failing that, from the
+  `ETag` of the update response. It is `None` on Space versions without it.
+
+> **Older Space versions.** A Space without optimistic concurrency ignores
+> `If-Match`, one without `keepBillingPeriod` ignores the query and restarts
+> the billing period, and one without `rejectPrivate` accepts private plans.
+> So the client does not trust the options blindly. When
+> `expected_contract_version`, `keep_billing_period` or `reject_private` is set:
+>
+> - **Before writing** it checks the `X-Space-Capabilities` header for
+>   `contract-version` / `keep-billing-period` / `reject-private`. The header
+>   is read from any Space response and cached per client for
+>   `CAPABILITIES_TTL_SECONDS` (60 s; `client.clear_capabilities()` forgets it). When nothing recent is known, it
+>   reads the contract once. If a token is missing it raises
+>   `SpaceFeatureUnsupportedError` (`capability`, `written=False`) and **writes
+>   nothing**. If that read's `ETag` already differs from
+>   `expected_contract_version` it raises `ContractChangedError` early;
+>   `If-Match` on the PUT is still the atomic check.
+> - **After writing** it raises `SpaceFeatureUnsupportedError` with
+>   `written=True` and the stored `contract` if the answer shows the option was
+>   ignored anyway: no `ETag` with `expected_contract_version`, or a different
+>   `billingPeriod.startDate` with `keep_billing_period`. The user's cache
+>   entries are dropped.
+> - `preview_novation(..., keep_billing_period=True)` or `reject_private=True`
+>   raises the same error when the Space that answered does not advertise
+>   `keep-billing-period` / `reject-private`.
+>
+> Without options nothing is checked and the request is the same single PUT
+> as before.
+
+`get_yaml` raises `PricingYamlUnavailableError` (a `SpaceApiError`) when Space
+knows the version but no longer has its original file. `get_pricings` is never
+served from cache: its `contract_version` matters only while it is current.
+
+> **Older Space versions.** These calls need a Space with the subscription-change
+> API. Without it, `get_pricings` and `get_new_contracts_pricing` get Space's
+> 404 (`SpaceApiError`). An older Space ignores `?format=yaml` and answers with
+> the JSON pricing; `get_yaml` then raises `SpaceFeatureUnsupportedError`
+> (`capability == "pricing-yaml"`) rather than returning JSON as if it were the
+> file: only `application/yaml`, `text/yaml` and their `x-` variants are accepted.
 
 ### FeatureModule
 
 | Method | Returns |
 |---|---|
-| `evaluate(user_id, feature_id, expected_consumption=None, details=False, server=False)` | `FeatureEvaluationResult` |
-| `revert_evaluation(user_id, feature_id, revert_to_latest=True)` | `bool` |
+| `evaluate(user_id, feature_id, expected_consumption=None, details=False, server=False, idempotency_key=None)` | `FeatureEvaluationResult` (with `consumption_id` after a consumption) |
+| `revert_consumption(user_id, feature_id, consumption_id, idempotency_key=None)` | `bool`: `True` reverted (now or before), `False` unknown or expired id (404) |
+| `revert_evaluation(user_id, feature_id, revert_to_latest=True, idempotency_key=None)` | `bool` (**deprecated**, emits `DeprecationWarning`: use `revert_consumption`) |
 | `generate_user_pricing_token(user_id)` | `str | None` |
+| `verify_pricing_token(token, organization_id=None, issuer=None, leeway=None)` | `PricingTokenPayload` |
 
-Java-style aliases are also available (`revertEvaluation`, `generateUserPricingToken`).
+Java-style aliases are also available (`revertEvaluation`, `revertConsumption`, `generateUserPricingToken`, `verifyPricingToken`).
+
+The writes in these tables carry an `Idempotency-Key`; see
+[Consumption, retries and Idempotency-Key](#consumption-retries-and-idempotency-key).
 
 ## Data Models
 
@@ -228,6 +403,10 @@ Main model classes are exported from `space_client.types`:
 - `SpaceConnectionOptions`
 - `CacheOptions`, `CacheType`, `ExternalCacheConfig`, `RedisConfig`
 - `Contract`, `ContractToCreate`, `Subscription`
+- `PricingYaml`, `ContractPricings`, `ContractServicePricing`, `NewContractsPricing`
+- `NovationPreview`, `NovationError`, `NovationErrorCode`, `NovationVersionChange`,
+  `NovationUsageWarning`, `NovationBillingPeriod`
+- `PricingTokenPayload`, `PricingTokenSubscription`, `decode_pricing_token`, `pricing_token_user_id`
 - `FeatureEvaluationResult`, `EvaluationError`
 - `BillingPeriod`, `BillingPeriodToCreate`, `ContractHistoryEntry`, `UsageLevel`, `UserContact`
 - `SpaceEvent`
@@ -280,6 +459,8 @@ Supported event names:
 - `pricing_archived`
 - `pricing_actived`
 - `service_disabled`
+- `contract_created`, `contract_novated`, `contract_deleted`, `contract_renewed`
+- `resync` (each time a namespace connects; see [Delivery guarantees](#delivery-guarantees))
 - `error`
 
 Example:
@@ -293,12 +474,332 @@ client.on("pricing_created", on_pricing_created)
 client.connect()
 ```
 
+### Contract events
+
+Contract events arrive on the authenticated `/contracts` namespace, and only for
+contracts of the API key's organisation. The client joins it (sending the key as
+Socket.IO `auth: {"apiKey": ...}` and as the `x-api-key` header) once a contract
+listener is registered. A member user key (`usr_...`) also has to name its
+organisation: pass `SpaceConnectionOptions(..., organization_id="org-1")` and the
+handshake sends `auth: {"apiKey": ..., "organizationId": "org-1"}`. Organisation
+keys need nothing more.
+
+```python
+def on_novated(details):
+	# {"userId", "organizationId", "contractVersion", "services": [...]}
+	# contractVersion is a string, or None for contract_deleted.
+	print("Contract changed:", details["userId"], details["contractVersion"])
+
+
+client.on("contract_novated", on_novated)
+```
+
+- The cached entries of `details["userId"]` are invalidated before the callback
+  runs, so a callback that re-reads the contract or a pricing token gets fresh
+  data.
+- **Register contract listeners before connecting.** python-socketio joins
+  namespaces only when it connects, so adding the first contract listener to a
+  connected sync client disconnects and reconnects the socket. `/pricings`
+  events sent during that short window are lost, and `synchronized` fires
+  again on reconnection. `AsyncSpaceClient.on` cannot await: a contract listener
+  added after `connect()` only takes effect at the next `await client.connect()`,
+  and the client logs a warning (logger `space_client`) to say so.
+- A key Space refuses on `/contracts` is reported to the `error` listener.
+- Removing the last contract listener does not close the namespace; its events
+  are simply dropped until a listener is registered again.
+
+### Event ids and occurred_at
+
+Pricing and contract listeners receive `EventDetails`: the `details` dict Space
+sent, with the event's own fields as attributes.
+
+```python
+from space_client.types import EventDetails
+
+
+def on_novated(details: EventDetails):
+	details["userId"]        # the details, as before
+	details.code             # "CONTRACT_NOVATED"
+	details.event_id         # "019a2a6b-7c1e-7d3f-9b2a-5c4e8f1a2b3c", the same in every copy
+	details.occurred_at      # datetime (UTC): when Space stored the change
+	details.raw_occurred_at  # "2026-10-27T10:00:00.123Z", as sent
+```
+
+Space sends `eventId` and `occurredAt` from the version that advertises
+`contract-event-ids` in `X-Space-Capabilities`. With an older Space,
+`event_id` and `occurred_at` are `None` (`occurred_at` is also `None` if the
+value is not a valid date).
+
+### Delivery guarantees
+
+Space events are hints that something changed, not a log of the changes:
+
+- **At most once per connection, no replay.** An event goes to the connections
+  open when it is emitted. While the client is disconnected or reconnecting,
+  events are lost, and Space does not resend them.
+- **Repeats are possible.** A consumer with several connections gets one copy
+  per connection, all with the same `eventId`. The client drops a repeated
+  `eventId` before invalidating the cache or calling your listener. It
+  remembers the last 10,000 ids for up to 10 minutes (both namespaces share the
+  window); events without `eventId` are always delivered. Each client has its
+  own window, so two clients (or two replicas of your backend) each get their
+  copy, which is what each needs to refresh its own cache.
+- **No ordering.** Events may arrive in another order than the changes were
+  stored. Never order events by `event_id` (compare it for equality only), and
+  do not compare `occurred_at` across Space instances, whose clocks may differ.
+  `contractVersion` is a hash, not a counter.
+
+So treat a contract event as a reason to re-read the contract
+(`client.contracts.get_contract(user_id)`) and compare its `contractVersion`
+with the one you hold: unchanged means nothing to do, and a 404
+(`SpaceApiError`) means it was deleted. A late, repeated or out-of-order event then costs one read and changes
+nothing.
+
+After a reconnection, re-read the contracts you hold, because anything that
+changed while the client was disconnected was not announced. The `resync` event
+tells you when. It receives a `ResyncInfo(namespace, reconnect)`: `namespace`
+is `"pricings"` or `"contracts"`, and `reconnect` is `False` on the
+namespace's first connection and `True` after that. When `/contracts`
+reconnects, the client first invalidates the cached contracts, evaluations and
+pricing tokens of every user, so these reads go to Space:
+
+```python
+from space_client.types import ResyncInfo
+
+
+def on_resync(info: ResyncInfo):
+	if info.namespace == "contracts" and info.reconnect:
+		refresh_cached_contracts()  # e.g. get_contract() for each user you hold
+
+
+client.on("resync", on_resync)
+```
+
+If you read contracts before the contract listener joined `/contracts`,
+re-read them on the first `resync` too. python-socketio reconnects on its own
+(`reconnection=True`); the sync client's reconnection to add `/contracts` also
+fires `resync` for `pricings`.
+
+The deduplication window is configurable, or can be turned off:
+
+```python
+from space_client.types import EventDeduplicationOptions
+
+options = SpaceConnectionOptions(
+	url="http://localhost:5403",
+	api_key="your-api-key",
+	event_deduplication=EventDeduplicationOptions(max_entries=50_000, window_seconds=1800),
+	# or event_deduplication=False to deliver every copy
+)
+```
+
+## Pricing Tokens
+
+`features.generate_user_pricing_token(user_id)` returns a JWT signed by Space.
+To read it on the backend - for example to know the user's current
+subscription and `contract_version` - decode it:
+
+```python
+from space_client.types import decode_pricing_token
+
+payload = decode_pricing_token(client.features.generate_user_pricing_token("user-123"))
+if payload.subscription is not None:  # None for tokens from older Space versions
+	print(payload.subscription.contracted_services)
+	print(payload.subscription.subscription_plans, payload.subscription.subscription_add_ons)
+	print(payload.subscription.contract_version)
+```
+
+`decode_pricing_token` does **not** verify the signature: use it to read a token
+you just received from Space, never to authenticate one a client sent you.
+
+### Token claims: `userId`, `organizationId`, `aud`, `iss`
+
+A userId is unique only within its organization, so Space versions with
+per-organization userIds (capability `contract-userid-per-org`) issue tokens
+with these claims:
+
+| Claim | `PricingTokenPayload` | Value |
+| --- | --- | --- |
+| `sub` | `sub` | `urn:space:<organizationId>:<percent-encoded userId>`. Opaque: do not parse it. |
+| `userId` | `user_id` | The userId as stored in Space (not encoded). |
+| `organizationId` | `organization_id` | The organization of the contract. |
+| `aud` | `aud` | The organization the token is for (same value as `organizationId`). |
+| `iss` | `iss` | The Space server: its `JWT_ISSUER`, `space` by default. |
+
+Tokens of older Space versions only have the bare userId in `sub`; the other
+fields are then `None`. `pricing_token_user_id(payload)` returns `user_id` and
+falls back to `sub` only when the token has no `userId` claim (an older
+server); it never parses the URN. Code that used `payload.sub` as the userId
+should switch to it:
+
+```python
+from space_client.types import decode_pricing_token, pricing_token_user_id
+
+payload = decode_pricing_token(token)
+user_id = pricing_token_user_id(payload)
+```
+
+When a token is checked on the server side, also compare `organization_id` (or
+`aud`) with your organization: the same userId can exist in another
+organization of the same Space.
+
+## Consumption, retries and Idempotency-Key
+
+Consumptions (`evaluate` with an `expected_consumption`), reverts, contract
+creation, novations (single and by group) and usage level changes are writes
+that must not be applied twice when a request is retried after a timeout or a
+dropped connection. Each of these calls sends an `Idempotency-Key` header. On a
+Space with the `idempotency-key` capability, a request repeated with the same
+key gets the stored outcome of the first one (`Idempotent-Replayed: true`) and
+applies nothing; an older Space ignores the header. Evaluations without a
+consumption and reads carry no key.
+
+- **Generated keys.** By default the client creates a random UUID v4 per call
+  and reuses it for that call's own retries, which covers retries inside one
+  process.
+- **Your own key.** When the operation may be retried after the process
+  restarts (a job queue, an outbox, a webhook handler), create the key once,
+  store it with the operation and pass it on every attempt
+  (`idempotency_key=...`). Use a new key for each new operation, and a new key
+  after correcting a request Space refused with a `4xx`. With a key of your own
+  the client first checks that Space advertises `idempotency-key` and raises
+  `SpaceFeatureUnsupportedError` (`written=False`, nothing sent) if it does not.
+  A key that is not 1 to 255 characters raises `ValueError`.
+- **Retries** are off by default (`SpaceConnectionOptions(retries=0)`). With
+  `retries=n` (0 to 10) the client retries those keyed writes, with the same
+  key and the same request, after a `SpaceConnectionError`, a `5xx` or a
+  `409 IDEMPOTENCY_IN_PROGRESS`, and only while Space advertises
+  `idempotency-key` (without it each retry could be applied again). It waits
+  `Retry-After` when Space sends one (and stops if that is longer than
+  `retry_max_delay_ms`), otherwise an exponential backoff with jitter from
+  `retry_base_delay_ms` (250 ms) up to `retry_max_delay_ms` (10 s). Other `4xx`
+  and requests without a key are never retried.
+
+```python
+from space_client import IdempotencyInProgressError, SpaceClientFactory
+from space_client.types import SpaceConnectionOptions
+
+client = SpaceClientFactory.connect(
+    SpaceConnectionOptions(url="http://localhost:3000", api_key="your-api-key", retries=2)
+)
+
+# job.idempotency_key = str(uuid.uuid4()), created and stored when the job was enqueued.
+result = client.features.evaluate(
+    job.user_id, "acme-exports", {"acme-maxExports": 1}, idempotency_key=job.idempotency_key
+)
+if not result.eval:
+    return  # over the limit: nothing was consumed
+try:
+    run_export(job)
+except Exception:
+    # Give back exactly this consumption, whatever happened meanwhile.
+    client.features.revert_consumption(
+        job.user_id, "acme-exports", result.consumption_id,
+        idempotency_key=f"{job.idempotency_key}:revert",
+    )
+    raise
+```
+
+With `atomic-usage-limits`, Space applies a consumption only if every amount
+fits its limit, also under concurrency; one that does not fit answers
+`eval=False` and consumes nothing. A `consumption_id` stays revertible for
+Space's `CONSUMPTION_RETENTION_SECONDS` (24 h by default), and keys are
+remembered for `IDEMPOTENCY_KEY_TTL_SECONDS` (24 h by default).
+
+### Verifying pricing tokens
+
+Space versions with the capability `pricing-token-jwks` sign pricing tokens
+with ES256 and publish the public keys at
+`GET {url}/api/v1/.well-known/jwks.json` (no API key). A token that comes back
+to your backend (from a browser, a queue, another service) can then be verified
+with public material only. It needs the `verify` extra.
+
+```python
+payload = client.features.verify_pricing_token(token, organization_id="my-org-id")
+user_id = pricing_token_user_id(payload)
+```
+
+or, without a client:
+
+```python
+from space_client import PricingTokenVerifier
+
+verifier = PricingTokenVerifier("https://space.example.com", organization_id="my-org-id")
+payload = verifier.verify(token)
+```
+
+`AsyncPricingTokenVerifier` takes the same arguments and its `verify` is
+awaited; `AsyncSpaceClient.features.verify_pricing_token` is awaited too.
+
+What is checked:
+
+- The signature is ES256 by a key of the JWKS, chosen by the token's `kid`.
+  Any other `alg` (`HS256`, `none`, ...) is rejected, and so is a token with a
+  `jwk`, `jku`, `x5u` or `x5c` header: keys only come from the JWKS URL of your
+  Space.
+- `exp` is required and checked (`leeway`, in seconds, default 0).
+- `iss` equals `issuer` (the `JWT_ISSUER` of your Space, `space` by default).
+- `aud` and `organizationId` equal the expected organization. It is required:
+  pass `organization_id` to the call or to the verifier; the client uses its own
+  `organization_id` option when the call names none. A userId is only unique
+  within an organization, so a valid signature alone does not tell you the token
+  is for one of your users.
+
+The JWKS is cached for the `max-age` of its response (Space sends 5 minutes;
+5 minutes also without `Cache-Control`, nothing with `no-store`/`no-cache`) and
+fetched again when a token names a `kid` it does not know, at most once per
+`refetch_cooldown` (default 30 s), so key rotations need nothing on your side.
+Keep one verifier (or one client) and reuse it.
+
+Errors, all `PricingTokenVerificationError` (a `SpaceError`) with a `code`:
+`PricingTokenSignatureError` (forged or tampered token),
+`PricingTokenExpiredError` (`expired_at`), `PricingTokenAudienceError` (another
+organization), `PricingTokenIssuerError`, `PricingTokenUnknownKeyError` (`kid`
+not published, e.g. a removed key), and the base class with
+`PRICING_TOKEN_INVALID` (malformed token, wrong `alg`, forbidden header,
+missing claims) or `PRICING_TOKEN_JWKS_UNAVAILABLE` (the JWKS could not be
+fetched). A Space that does not publish its keys (older versions, or one in the
+deprecated `PRICING_TOKEN_ALG=HS256` mode) raises `SpaceFeatureUnsupportedError`
+with `capability == "pricing-token-jwks"`.
+
 ## Error Handling
 
 - Factory validation raises `ValueError` for invalid input.
 - A request Space refused raises `SpaceApiError`, carrying the status code, the
   method and path, and whatever body came back.
 - A request that never arrived raises `SpaceConnectionError`.
+- `pricings.get_yaml(...)` raises `PricingYamlUnavailableError`, a subclass of
+  `SpaceApiError`, when Space cannot provide the original Pricing2Yaml file.
+- `SpaceFeatureUnsupportedError` (a `SpaceError`, not a `SpaceApiError`) means
+  the connected Space lacks a feature the call depends on; `capability` names
+  it with its `X-Space-Capabilities` token (e.g. `pricing-yaml` when `get_yaml`
+  receives JSON from a Space that ignores `format=yaml`). `written` says
+  whether Space changed anything.
+- `contracts.update_contract_subscription(..., expected_contract_version=...)`
+  raises `ContractChangedError`, a subclass of `SpaceApiError`, when the
+  contract changed since that version (HTTP 412). It carries `user_id`,
+  `expected_contract_version` and the current `contract_version`, and the
+  user's cached entries are invalidated.
+- With `expected_contract_version`, `keep_billing_period` or `reject_private`,
+  the same call raises `SpaceFeatureUnsupportedError` when the connected Space does not
+  implement the option (`written=False`, nothing sent) or applied the change
+  without honouring it (`written=True`, `contract` set). An explicit empty
+  `expected_contract_version` raises `ValueError`.
+- On the keyed writes, Space's idempotency refusals raise subclasses of
+  `IdempotencyError` (itself a `SpaceApiError`, with `code` and
+  `idempotency_key`): `IdempotencyConflictError` (`409 IDEMPOTENCY_CONFLICT`,
+  the key was used for a different request), `IdempotencyInProgressError`
+  (`409 IDEMPOTENCY_IN_PROGRESS` once the retries are spent; `retry_after` in
+  seconds; retry later with the same key) and `IdempotencyKeyInvalidError`
+  (`400 IDEMPOTENCY_KEY_INVALID`). `SpaceApiError.headers` holds the response
+  headers.
+- `features.revert_consumption(...)` raises `SpaceFeatureUnsupportedError`
+  (`capability == "atomic-usage-limits"`) without sending anything on a Space
+  that cannot revert by id.
+
+- `features.verify_pricing_token(...)` and `PricingTokenVerifier.verify(...)`
+  raise `PricingTokenVerificationError` or one of its subclasses (see
+  [Verifying pricing tokens](#verifying-pricing-tokens)).
 - `FeatureModule.evaluate(...)` returns an object containing `error` when Space
   answers successfully with something that is not a usable evaluation.
 
@@ -312,6 +813,11 @@ Run tests locally:
 pip install -e .[dev]
 pytest
 ```
+
+Tests never reach a live Space: the older ones stub the HTTP client, the
+subscription-change ones mock httpx's transport with
+[respx](https://lundberg.github.io/respx/) and run against both the sync and the
+async client.
 
 CI executes tests on every pull request for Python `3.10`, `3.11`, and `3.12`.
 

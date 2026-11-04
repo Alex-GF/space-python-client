@@ -44,11 +44,22 @@ class SpaceApiError(SpaceError):
     and it is lost the moment the response is turned into ``None``.
     """
 
-    def __init__(self, status_code: int, method: str, path: str, payload: Any = None):
+    def __init__(
+        self,
+        status_code: int,
+        method: str,
+        path: str,
+        payload: Any = None,
+        headers: Any = None,
+    ):
         self.status_code = status_code
         self.method = method
         self.path = path
         self.payload = payload
+        # Response headers, names in lower case (``retry-after``...).
+        self.headers: dict[str, str] = {
+            str(name).lower(): str(value) for name, value in dict(headers or {}).items()
+        }
 
         detail = _describe(payload)
         super().__init__(
@@ -75,3 +86,275 @@ def _describe(payload: Any) -> str:
             return str(message)
     text = str(payload).strip()
     return text[:500]
+
+
+class SpaceFeatureUnsupportedError(SpaceError):
+    """The connected Space does not implement a feature the call depends on.
+
+    Raised instead of quietly doing something else: returning the JSON pricing
+    as if it were the YAML file, or writing a novation without the guarantee
+    the caller asked for. ``capability`` is the ``X-Space-Capabilities`` token
+    of the missing feature (``pricing-yaml``, ``contract-version``,
+    ``keep-billing-period``...).
+
+    ``written`` says whether Space changed anything. It is False when the
+    client refused before sending a write (or for a read); it is True only for
+    the post-write backstop, when the response shows that Space applied a
+    novation without the guarantee - the change is then in place and
+    ``contract`` holds what Space answered.
+
+    Not a :class:`SpaceApiError`: Space did not refuse anything.
+    """
+
+    code = "SPACE_FEATURE_UNSUPPORTED"
+
+    def __init__(
+        self,
+        capability: str,
+        message: str | None = None,
+        written: bool = False,
+        contract: Any = None,
+    ):
+        self.capability = capability
+        self.written = written
+        self.contract = contract
+        super().__init__(message or f'The connected Space does not support "{capability}"')
+
+
+class PricingYamlUnavailableError(SpaceApiError):
+    """Space knows the pricing version but cannot hand out its original file.
+
+    Raised by ``pricings.get_yaml`` on ``404 {"error": "PRICING_YAML_UNAVAILABLE"}``:
+    historical SPHERE-linked versions may survive only as parsed JSON. It is a
+    :class:`SpaceApiError`, so code that already catches refusals still does.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        method: str,
+        path: str,
+        payload: Any = None,
+        service_name: str = "",
+        pricing_version: str = "",
+    ):
+        super().__init__(status_code, method, path, payload)
+        self.service_name = service_name
+        self.pricing_version = pricing_version
+
+    @classmethod
+    def from_error(
+        cls, error: SpaceApiError, service_name: str, pricing_version: str
+    ) -> "PricingYamlUnavailableError":
+        return cls(
+            error.status_code,
+            error.method,
+            error.path,
+            error.payload,
+            service_name=service_name,
+            pricing_version=pricing_version,
+        )
+
+
+class ContractChangedError(SpaceApiError):
+    """The contract changed since the version the caller computed its change on.
+
+    Raised by ``contracts.update_contract_subscription`` when an
+    ``expected_contract_version`` was given and Space answered
+    ``412 {"error": "CONTRACT_CHANGED", "contractVersion": "<current>"}``:
+    someone else novated, renewed or edited the contract in the meantime.
+    Re-read it (or preview again), show the customer the new situation and ask
+    them to confirm; ``contract_version`` is the version to send next time.
+    """
+
+    code = "CONTRACT_CHANGED"
+
+    def __init__(
+        self,
+        status_code: int,
+        method: str,
+        path: str,
+        payload: Any = None,
+        user_id: str = "",
+        expected_contract_version: str | None = None,
+        contract_version: str | None = None,
+    ):
+        super().__init__(status_code, method, path, payload)
+        self.user_id = user_id
+        self.expected_contract_version = expected_contract_version
+        self.contract_version = contract_version
+        message = (
+            f"The contract of user {user_id} changed (expected "
+            f"{expected_contract_version or 'unknown'}, current {contract_version or 'unknown'})"
+        )
+        self.args = (message,)
+
+    @classmethod
+    def from_error(
+        cls, error: SpaceApiError, user_id: str, expected_contract_version: str | None
+    ) -> "ContractChangedError":
+        payload = error.payload if isinstance(error.payload, dict) else {}
+        return cls(
+            error.status_code,
+            error.method,
+            error.path,
+            error.payload,
+            user_id=user_id,
+            expected_contract_version=expected_contract_version,
+            contract_version=payload.get("contractVersion"),
+        )
+
+
+class IdempotencyError(SpaceApiError):
+    """Space refused a write because of its ``Idempotency-Key``.
+
+    Raised for the three refusals of the ``idempotency-key`` capability; this
+    request applied nothing. ``code`` is Space's code and ``idempotency_key``
+    the key the request carried. A :class:`SpaceApiError`, so code that
+    catches refusals still does.
+    """
+
+    code = ""
+
+    def __init__(
+        self,
+        status_code: int,
+        method: str,
+        path: str,
+        payload: Any = None,
+        headers: Any = None,
+        idempotency_key: str = "",
+    ):
+        super().__init__(status_code, method, path, payload, headers)
+        self.idempotency_key = idempotency_key
+
+    @classmethod
+    def from_error(cls, error: SpaceApiError, idempotency_key: str) -> "IdempotencyError":
+        return cls(
+            error.status_code,
+            error.method,
+            error.path,
+            error.payload,
+            error.headers,
+            idempotency_key=idempotency_key,
+        )
+
+
+class IdempotencyConflictError(IdempotencyError):
+    """``409 IDEMPOTENCY_CONFLICT``: the key was used for a different request.
+
+    Another body, query, route or ``If-Match`` was sent with this key before.
+    Nothing was applied. A new operation needs a new key; reusing one for
+    another operation is a bug of the caller.
+    """
+
+    code = "IDEMPOTENCY_CONFLICT"
+
+
+class IdempotencyInProgressError(IdempotencyError):
+    """``409 IDEMPOTENCY_IN_PROGRESS``: a request with the key is still running.
+
+    Raised once the client's retries (if any) are spent. Retry later with the
+    SAME key: Space then replays the outcome of the running request.
+    ``retry_after`` is Space's ``Retry-After`` in seconds, or None.
+    """
+
+    code = "IDEMPOTENCY_IN_PROGRESS"
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.retry_after: int | None = parse_retry_after(self.headers.get("retry-after"))
+
+
+class IdempotencyKeyInvalidError(IdempotencyError):
+    """``400 IDEMPOTENCY_KEY_INVALID``: the key is empty or longer than 255 characters."""
+
+    code = "IDEMPOTENCY_KEY_INVALID"
+
+
+def parse_retry_after(value: str | None) -> int | None:
+    """``Retry-After`` in seconds: delta-seconds or an HTTP date; None if absent or unreadable."""
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+
+    try:
+        moment = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    seconds = (moment - datetime.now(timezone.utc)).total_seconds()
+    return max(0, int(seconds + 0.999))
+
+class PricingTokenVerificationError(SpaceError):
+    """A pricing token cannot be trusted.
+
+    Raised by ``PricingTokenVerifier.verify`` (and ``features.verify_pricing_token``).
+    The subclasses name the usual reasons; this class itself is used, with
+    ``code``:
+
+    * ``PRICING_TOKEN_INVALID``: a malformed token, an algorithm other than
+      ES256 (``HS256``, ``none``...), a ``jwk``/``jku``/``x5u``/``x5c`` header,
+      or a missing or invalid claim;
+    * ``PRICING_TOKEN_JWKS_UNAVAILABLE``: the JWKS could not be fetched.
+
+    The underlying error, if any, is the ``__cause__``.
+    """
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(message)
+
+
+class PricingTokenSignatureError(PricingTokenVerificationError):
+    """The signature does not match the published key the token names."""
+
+    def __init__(self) -> None:
+        super().__init__("PRICING_TOKEN_SIGNATURE_INVALID", "The pricing token signature is invalid")
+
+
+class PricingTokenExpiredError(PricingTokenVerificationError):
+    """The token expired (``exp``, after the leeway). ``expired_at`` is when."""
+
+    def __init__(self, expired_at: Any = None) -> None:
+        self.expired_at = expired_at
+        super().__init__("PRICING_TOKEN_EXPIRED", "The pricing token has expired")
+
+
+class PricingTokenAudienceError(PricingTokenVerificationError):
+    """The token was issued for another organization (``aud`` or ``organizationId``)."""
+
+    def __init__(self, expected: str, actual: Any = None) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            "PRICING_TOKEN_WRONG_AUDIENCE",
+            f"The pricing token was not issued for organization {expected}",
+        )
+
+
+class PricingTokenIssuerError(PricingTokenVerificationError):
+    """The token was issued by another server (``iss``)."""
+
+    def __init__(self, expected: str, actual: Any = None) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__("PRICING_TOKEN_WRONG_ISSUER", f"The pricing token was not issued by {expected}")
+
+
+class PricingTokenUnknownKeyError(PricingTokenVerificationError):
+    """The token names a ``kid`` SPACE does not publish, even after fetching the keys again.
+
+    A key that was removed (rotation, leaked key) or a token SPACE did not sign.
+    """
+
+    def __init__(self, kid: str) -> None:
+        self.kid = kid
+        super().__init__(
+            "PRICING_TOKEN_UNKNOWN_KID", f'SPACE does not publish the key "{kid}" of this pricing token'
+        )
