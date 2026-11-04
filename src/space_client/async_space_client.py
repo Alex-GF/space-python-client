@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Callable
 
 import httpx
 import socketio
@@ -14,6 +15,8 @@ from .modules.feature_module import AsyncFeatureModule
 from .modules.pricing_module import AsyncPricingModule
 from .modules.service_module import AsyncServiceModule
 from .types.space_connection_options import SpaceConnectionOptions
+
+logger = logging.getLogger("space_client")
 
 
 class AsyncSpaceClient(BaseSpaceClient):
@@ -72,6 +75,33 @@ class AsyncSpaceClient(BaseSpaceClient):
         )
         self._configure_socket_handlers()
 
+    def on(self, event: str, callback: Callable[[Any], None]) -> None:
+        """Register an event listener callback.
+
+        ``on`` cannot await, so a contract listener registered while the
+        socket is connected without ``/contracts`` only takes effect at the
+        next ``await client.connect()``; a warning is logged then. Register
+        contract listeners before connecting to avoid it.
+
+        Args:
+            event (str): Event name (see :meth:`BaseSpaceClient.on`).
+            callback (Callable[[Any], None]): Function invoked with event payload.
+
+        Returns:
+            None: Listener registration updates internal callback registry.
+        """
+        super().on(event, callback)
+        if (
+            event.lower() in self._CONTRACT_EVENTS
+            and self._socket_namespaces
+            and not self._socket_is_current()
+        ):
+            logger.warning(
+                "Contract listener %r registered after connect(): call `await client.connect()` "
+                "again to join /contracts, or register contract listeners before connecting",
+                event,
+            )
+
     async def is_connected_to_space(self) -> bool:
         """Check Space health endpoint availability.
 
@@ -88,13 +118,20 @@ class AsyncSpaceClient(BaseSpaceClient):
 
         Returns:
             None: Failures are ignored, leaving the client usable over HTTP.
+            Joins ``/contracts`` too when a contract event listener is
+            registered; ``on`` cannot await, so register contract listeners
+            before connecting, or call ``connect()`` again afterwards.
         """
-        if self._socket.connected:
+        if self._socket_is_current():
             return
         try:
-            await self._socket.connect(
-                self._ws_url(), namespaces=["/pricings"], socketio_path="events", wait=False
-            )
+            if self._socket.connected:
+                # A namespace is being added: python-socketio joins namespaces
+                # when it connects, so connect again with the new set.
+                await self._socket.disconnect()
+            arguments = self._connect_arguments()
+            await self._socket.connect(self._ws_url(), **arguments)
+            self._socket_namespaces = arguments["namespaces"]
         except Exception:
             # The client should still be usable in HTTP-only mode.
             return
@@ -108,6 +145,7 @@ class AsyncSpaceClient(BaseSpaceClient):
         try:
             if self._socket.connected:
                 await self._socket.disconnect()
+            self._socket_namespaces = []
         except Exception:
             return
 
