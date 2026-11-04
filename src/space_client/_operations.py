@@ -27,6 +27,7 @@ from .errors import (
     SpaceFeatureUnsupportedError,
 )
 from .types.models import (
+    ConsumptionRevertResult,
     Contract,
     ContractPricings,
     ContractToCreate,
@@ -751,6 +752,7 @@ def revert_consumption(
     feature_id: str,
     consumption_id: str,
     idempotency_key: str | None = None,
+    detailed: bool = False,
 ) -> Work[bool]:
     """Revert exactly the consumption Space reported as ``consumptionId``.
 
@@ -763,8 +765,11 @@ def revert_consumption(
 
     def parse(cache: "CacheModule", response: Any) -> bool:
         if getattr(response, "status_code", 200) == 404:
-            return False
+            return ConsumptionRevertResult(consumption_id, False) if detailed else False
         _forget_usage(cache, user_id, feature_id)
+        if detailed:
+            payload = response.json() if response.status_code == 200 else {}
+            return ConsumptionRevertResult(consumption_id, True, payload.get("reverted"), list(payload.get("skipped", [])))
         return True
 
     key, explicit = _key(idempotency_key)

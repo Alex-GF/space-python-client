@@ -597,3 +597,13 @@ __all__ = [
     "UsageLevel",
     "UserContact",
 ]
+
+
+@dataclass
+class ConsumptionRevertResult:
+    """Refund outcome. A 204 has no per-limit amounts; 200 includes reverted/skipped."""
+
+    consumption_id: str
+    found: bool
+    reverted: dict[str, int | float] | None = None
+    skipped: list[str] = field(default_factory=list)

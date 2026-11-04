@@ -641,3 +641,35 @@ def test_has_capability_reads_the_healthcheck_once(make):
     assert call(client.has_capability("atomic-usage-limits")) is True
     assert call(client.has_capability("something-else")) is False
     assert health.call_count == 1
+
+
+@pytest.mark.parametrize('status', [200, 204, 404])
+@respx.mock
+def test_detailed_refund_preserves_partial_outcome(make, status):
+    build, call, _ = make
+    healthcheck()
+    payload = {'consumptionId': 'receipt', 'reverted': {'acme-maxPets': 1}, 'skipped': ['acme-missing']}
+    respx.post(FEATURE_URL).mock(return_value=httpx.Response(
+        status, headers=CAPABILITIES, json=payload if status == 200 else None,
+    ))
+    client = build()
+    result = call(client.features.revert_consumption_details('u1', 'acme-pets', 'receipt'))
+    assert result.consumption_id == 'receipt'
+    assert result.found is (status != 404)
+    assert result.reverted == (payload['reverted'] if status == 200 else None)
+    assert result.skipped == (payload['skipped'] if status == 200 else [])
+    assert call(client.features.revert_consumption('u1', 'acme-pets', 'receipt')) is (status != 404)
+
+
+@respx.mock
+def test_detailed_refund_does_not_retry_changed_state(make):
+    build, call, _ = make
+    healthcheck()
+    route = respx.post(FEATURE_URL).mock(return_value=httpx.Response(
+        409, headers=CAPABILITIES, json={'code': 'IDEMPOTENCY_STATE_CHANGED'},
+    ))
+    client = build(retries=2)
+    with pytest.raises(SpaceApiError) as error:
+        call(client.features.revert_consumption_details('u1', 'acme-pets', 'receipt'))
+    assert error.value.payload['code'] == 'IDEMPOTENCY_STATE_CHANGED'
+    assert route.call_count == 1
