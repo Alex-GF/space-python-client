@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "space-python-client"
-version = "1.0.0"
+version = "1.1.0"
 description = "Python client library for Space - pricing-driven self-adaptation platform"
 readme = "README.md"
 requires-python = ">=3.10"
