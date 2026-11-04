@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..types.models import ConsumptionRevertResult
+
 import warnings
 from typing import Any
 
@@ -94,6 +96,15 @@ class _FeatureCalls:
         """
         return self._run(operations.revert_consumption(user_id, feature_id, consumption_id, idempotency_key))
 
+    def revert_consumption_details(
+        self, user_id: str, feature_id: str, consumption_id: str,
+        idempotency_key: str | None = None,
+    ) -> Result[ConsumptionRevertResult]:
+        """Revert and preserve the server's reverted/skipped limits; bool API stays available."""
+        return self._run(operations.revert_consumption(
+            user_id, feature_id, consumption_id, idempotency_key, detailed=True
+        ))
+
     def revert_evaluation(
         self,
         user_id: str,
@@ -139,6 +150,7 @@ class _FeatureCalls:
     # Java compatibility aliases
     revertEvaluation = revert_evaluation
     revertConsumption = revert_consumption
+    revertConsumptionDetails = revert_consumption_details
     generateUserPricingToken = generate_user_pricing_token
 
 

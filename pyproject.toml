@@ -44,7 +44,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/Alex-GF/space-python-client"
-Documentation = "https://sphere-docs.vercel.app/docs/2.0.1/api/space/SDKs/Backend%20SDKs/space-java-client"
+Documentation = "https://sphere-docs.vercel.app/docs/2.0.1/api/space/SDKs/Backend%20SDKs/space-python-client"
 Repository = "https://github.com/Alex-GF/space-python-client"
 Issues = "https://github.com/Alex-GF/space-python-client/issues"
 

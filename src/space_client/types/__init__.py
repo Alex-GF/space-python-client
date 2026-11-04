@@ -3,6 +3,7 @@ from .event_details import EventDeduplicationOptions, EventDetails, ResyncInfo
 from .models import (
     BillingPeriod,
     BillingPeriodToCreate,
+    ConsumptionRevertResult,
     Contract,
     ContractHistoryEntry,
     ContractPricings,
@@ -36,6 +37,7 @@ __all__ = [
     "BillingPeriodToCreate",
     "CacheOptions",
     "CacheType",
+    "ConsumptionRevertResult",
     "Contract",
     "ContractHistoryEntry",
     "ContractPricings",

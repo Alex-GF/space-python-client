@@ -1,5 +1,30 @@
 # Space Python Client
 
+## Release 1.1.0
+
+This minor release preserves existing public methods and adds subscription reads, contract events,
+multiorganization token claims, event deduplication and JWKS verification. Backend SDKs also
+provide pricing YAML reads, novation previews, optimistic concurrency and opt-in idempotent retries.
+Use a SPACE server advertising the required `X-Space-Capabilities`; merging server changes alone
+does not deploy them. Read `userId` through the provided helper: `sub` is opaque.
+
+### Detailed consumption reversions
+
+`features.revert_consumption_details(user_id, feature_id, consumption_id, idempotency_key=None)` preserves the server's refund details. The existing boolean
+`revertConsumption` / `revert_consumption` remains available and unchanged.
+
+| SPACE response | Detailed result |
+| --- | --- |
+| 204 | Found; nothing omitted. No per-limit amounts were returned (`reverted` is absent/null). |
+| 200 | Found; `reverted` contains amounts and `skipped` identifies limits which no longer exist. |
+| 404 | Not found; nothing was changed by this request. |
+| 409 | An API error is propagated, including a disabled service or `IDEMPOTENCY_STATE_CHANGED`; no automatic retry. |
+
+The result is `ConsumptionRevertResult`: consumption ID, `found`, optional `reverted` amounts and
+`skipped` limit IDs (Python uses `consumption_id`; Java uses getters and `isFound()`). To retry one
+operation across process restarts, store and reuse its idempotency key. A new key means a new operation.
+A successful signature still requires the application to match the token's user to its authenticated user.
+
 Python client library for [Space](https://github.com/isa-group/space), a pricing-driven self-adaptation platform for SaaS applications.
 
 [![PyPI](https://img.shields.io/pypi/v/space-python-client.svg)](https://pypi.org/project/space-python-client)
@@ -366,13 +391,10 @@ served from cache: its `contract_version` matters only while it is current.
 | `generate_user_pricing_token(user_id)` | `str | None` |
 | `verify_pricing_token(token, organization_id=None, issuer=None, leeway=None)` | `PricingTokenPayload` |
 
-Java-style aliases are also available (`revertEvaluation`, `revertConsumption`, `generateUserPricingToken`).
+Java-style aliases are also available (`revertEvaluation`, `revertConsumption`, `generateUserPricingToken`, `verifyPricingToken`).
 
 The writes in these tables carry an `Idempotency-Key`; see
 [Consumption, retries and Idempotency-Key](#consumption-retries-and-idempotency-key).
-
-Java-style aliases are also available (`revertEvaluation`, `generateUserPricingToken`,
-`verifyPricingToken`).
 
 ## Data Models
 
